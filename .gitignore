@@ -1,0 +1,25 @@
+# 本地环境、模型和用户数据绝不进入版本库。
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+data/
+models/
+runtime/
+logs/
+config.local.json
+.env
+.env.*
+!.env.example
+build/
+dist/
+test-results/
+playwright-report/
+*.sqlite*
+*.log
+environment-backups/
+.codex/
