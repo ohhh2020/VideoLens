@@ -268,15 +268,18 @@ def test_write_rate_limit_does_not_block_progress_reads(setup):
         assert client.get("/api/v1/tasks/task-1").status_code == 200
 
 
-def test_gradio_media_requires_its_login_session(setup, monkeypatch):
+def test_gradio_needs_no_login_but_api_keeps_token(setup, monkeypatch):
     monkeypatch.setenv("GRADIO_ANALYTICS_ENABLED", "False")
     pytest.importorskip("gradio")
     settings, service = setup
     with TestClient(create_app(settings, service, with_ui=True), raise_server_exceptions=True) as client:
-        assert client.get("/app/videolens-media/video-1").status_code == 401
-        login = client.post("/app/login", data={"username": "videolens", "password": "unit-test-token"})
-        assert login.status_code == 200
+        assert client.get("/app/").status_code == 200
+        assert client.get("/app/config").json().get("auth_required") is not True
+        config = client.get("/app/config").json()
+        labels = [item.get("props", {}).get("label", "") for item in config["components"]]
+        assert "可选字幕（SRT / VTT / ASS）" not in labels
+        assert "本地模型" in labels and "问答提示词" in labels
         assert client.get("/app/videolens-media/video-1").content == b"sample-video-content"
         assert "中文报告" in client.get("/app/videolens-export/video-1/markdown").text
-        # 登录不把后端 API 令牌的权限扩展到未经 Bearer 鉴权的 API。
+        # 免登录网页不改变内部 API 的 Bearer 鉴权。
         assert client.get("/api/v1/videos").status_code == 401

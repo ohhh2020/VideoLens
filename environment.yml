@@ -1,4 +1,4 @@
-# 首次创建使用此文件；一键脚本优先复用同名环境，不写入 base。
+# 参考环境清单；使用一键配置脚本创建项目内 envs/VideoLens，不使用外部同名环境。
 name: VideoLens
 channels:
   - conda-forge

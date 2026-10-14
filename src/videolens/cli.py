@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
 import threading
 import time
-import webbrowser
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -141,7 +141,7 @@ def _serve(settings, args) -> int:
     # model_copy(update=...) 不执行校验；显式重建可拒绝意外监听公网地址。
     if args.host or args.port:
         values = settings.model_dump()
-        values.update({"api_token": settings.api_token, "ui_password": settings.ui_password})
+        values.update({"api_token": settings.api_token})
         if args.host:
             values["host"] = args.host
         if args.port:
@@ -156,21 +156,24 @@ def _serve(settings, args) -> int:
         raise RuntimeError(f"端口 {settings.port} 已被占用或不可用；请关闭重复的知影窗口，或在配置中更换端口。") from exc
     host = "[::1]" if settings.host == "::1" else settings.host
     address = f"http://{host}:{settings.port}"
-    print(f"知影正在启动：{address}/app")
-    print(f"登录用户名：{settings.ui_username}；密码保存在本机 data/.access-token（不会打印到日志）。")
+    logging.getLogger(__name__).info("知影正在启动：%s/app（无需登录）", address)
     if args.open_browser:
         def open_when_ready():
             for _ in range(120):
                 try:
                     with httpx.Client(timeout=1, trust_env=False) as client:
                         if client.get(address + "/health").is_success:
-                            webbrowser.open(address + ("/health" if args.no_ui else "/app"))
+                            from .paths import open_project_browser
+                            try:
+                                open_project_browser(address + ("/health" if args.no_ui else "/app"))
+                            except RuntimeError as exc:
+                                logging.getLogger(__name__).warning("%s", exc)
                             return
                 except httpx.HTTPError:
                     pass
                 time.sleep(0.5)
         threading.Thread(target=open_when_ready, daemon=True, name="videolens-browser").start()
-    uvicorn.run(create_app(settings, with_ui=not args.no_ui), host=settings.host, port=settings.port, access_log=False)
+    uvicorn.run(create_app(settings, with_ui=not args.no_ui), host=settings.host, port=settings.port, access_log=False, log_config=None)
     return 0
 
 
@@ -180,6 +183,9 @@ def main(argv: list[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
+    from .logging_setup import configure_logging
+    from .paths import configure_paths
+    configure_logging(configure_paths())
     parser = _parser()
     args = parser.parse_args(argv)
     try:

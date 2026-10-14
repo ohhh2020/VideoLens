@@ -23,6 +23,7 @@ def keywords(text: str, limit: int = 12) -> list[str]:
     """关键词是离线降级的依据，不要求任何生成模型可用。"""
     try:
         import jieba.analyse
+        jieba.setLogLevel(30)
 
         return jieba.analyse.extract_tags(text, topK=limit)
     except ImportError:

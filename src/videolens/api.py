@@ -1,7 +1,7 @@
 """HTTP 接入层：只负责鉴权、输入输出和流式传输，业务交给 VideoService。
 
 新手阅读顺序：create_app → require_token → upload_video → task_events。
-API 密钥仅用于本机调用，浏览器通过 Gradio 登录会话访问自己的媒体代理。
+API 令牌仅用于内部调用；本机网页无需账号密码，媒体通过本机代理访问。
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import logging
 import re
 import tempfile
 import time
+import threading
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -67,6 +68,18 @@ class KeyInput(InputModel):
     key: str = Field(min_length=1, max_length=8192)
 
 
+class ModelTransfer(InputModel):
+    path: str = ""
+    url: str = ""
+    name: str = Field(default="", max_length=160)
+    sha256: str = ""
+
+
+class ModelActivation(InputModel):
+    gpu_layers: int = Field(default=0, ge=0, le=999)
+    context: int = Field(default=8192, ge=1024, le=131072)
+
+
 def sse_event(event: str, data: Any, event_id: int | None = None) -> str:
     """把一个完整事件编码成 SSE；JSON 会转义换行，防止破坏事件边界。"""
     safe_event = event.replace("\n", "").replace("\r", "")
@@ -87,6 +100,9 @@ def _loopback(host: str | None) -> bool:
 def create_app(settings: Any = None, service: Any = None, with_ui: bool = True) -> FastAPI:
     """构建应用；注入 service 使测试可以验证协议而不用下载模型。"""
     settings = settings or load_settings()
+    from .logging_setup import configure_logging
+    from .paths import configure_paths
+    configure_logging(configure_paths())
     if service is None:
         from .service import VideoService
         service = VideoService(settings)
@@ -99,6 +115,8 @@ def create_app(settings: Any = None, service: Any = None, with_ui: bool = True) 
             yield
         finally:
             await run_in_threadpool(service.close)
+            if hasattr(app.state, "local_models"):
+                await run_in_threadpool(app.state.local_models.close)
 
     app = FastAPI(title="知影 VideoLens 本地 API", version="1.0.0", lifespan=lifespan,
                   description="视频分析、检索、可追溯问答。除健康检查外使用 Bearer 令牌。",
@@ -404,6 +422,48 @@ def create_app(settings: Any = None, service: Any = None, with_ui: bool = True) 
     @router.post("/cleanup", tags=["维护"])
     def cleanup():
         return service.cleanup()
+
+    # 延迟初始化，构建网页/协议测试时不会自动下载或启动模型。
+    manager_lock = threading.Lock()
+
+    def model_manager():
+        with manager_lock:
+            if not hasattr(app.state, "local_models"):
+                from .local_models import LocalModels
+                app.state.local_models = LocalModels(service)
+            return app.state.local_models
+
+    @router.get("/local-models", tags=["本地模型"])
+    def local_models():
+        return model_manager().listing()
+
+    @router.post("/local-models/import", tags=["本地模型"], status_code=202)
+    def import_model(body: ModelTransfer, request: Request):
+        if not _loopback(request.client.host if request.client else None):
+            raise HTTPException(403, "只能从本机导入模型")
+        return model_manager().submit("import", **body.model_dump())
+
+    @router.post("/local-models/download", tags=["本地模型"], status_code=202)
+    def download_model(body: ModelTransfer):
+        return model_manager().submit("download", **body.model_dump())
+
+    @router.post("/local-models/runtime/{variant}", tags=["本地模型"], status_code=202)
+    def deploy_runtime(variant: str):
+        if variant not in {"cpu", "cuda"}:
+            raise HTTPException(422, "仅支持 cpu 或 cuda")
+        return model_manager().submit("runtime", variant=variant)
+
+    @router.post("/local-models/stop", tags=["本地模型"])
+    def stop_model():
+        return model_manager().stop()
+
+    @router.post("/local-models/{model_id}/start", tags=["本地模型"])
+    def activate_model(model_id: str, body: ModelActivation):
+        return model_manager().activate(model_id, body.gpu_layers, body.context)
+
+    @router.delete("/local-models/{model_id}", tags=["本地模型"])
+    def delete_model(model_id: str):
+        return model_manager().delete(model_id)
 
     app.include_router(router)
     if with_ui:

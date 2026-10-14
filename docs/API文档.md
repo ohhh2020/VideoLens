@@ -1,6 +1,6 @@
 # API 文档
 
-服务默认地址 `http://127.0.0.1:8000`，业务接口前缀 `/api/v1`。除 `/health` 外，API 需要请求头 `Authorization: Bearer <本地访问令牌>`。令牌来自 `data/.access-token` 或 `VIDEOLENS_API_TOKEN` 环境变量。网页通过自己的登录会话访问受保护媒体。
+服务默认地址 `http://127.0.0.1:8000`，业务接口前缀 `/api/v1`。除 `/health` 外，API 需要请求头 `Authorization: Bearer <本地访问令牌>`。令牌来自 `data/.access-token` 或 `VIDEOLENS_API_TOKEN` 环境变量。本机网页无需登录，通过媒体代理下载报告；内部 API 仍使用令牌。
 
 ## 1. 获取最新接口定义
 
@@ -40,7 +40,7 @@ Invoke-RestMethod 'http://127.0.0.1:8000/api/v1/openapi.json' -Headers $headers
 | `POST /sessions/{session_id}/ask` | `question`、`stream` | 普通 JSON 或 SSE 回答 |
 | `GET /settings` | 无 | 公开设置，无 API Key 和访问令牌 |
 | `PATCH /settings` | 要修改的设置字段 | 校验并保存设置 |
-| `PUT /keys/{reference}` | `{"key":"实际密钥"}` | 写系统凭据库；没有读密钥接口 |
+| `PUT /keys/{reference}` | `{"key":"实际密钥"}` | 写项目内 DPAPI 加密文件；没有读密钥接口 |
 | `POST /providers/{kind}/check` | `text` 或 `vision` | 检查对应供应商连接 |
 | `GET /doctor` | 无 | 运行环境、模型与存储诊断 |
 | `POST /cleanup` | 无 | 按已配置 TTL 清理受管数据 |
@@ -95,3 +95,23 @@ data: {"stage":"frames","progress":0.5}
 不存在“读取云端密钥”接口。公开设置只保留 Provider 的 `key_ref`；将它交给后端凭据库取得实际密钥。视频路径导入仅用于本机接口；HTTP 响应中的 ID 不能被当作任意磁盘路径使用。
 
 API 的分析任务状态和用户请求状态不同：收到 `pause` 请求后可能先进入暂停请求状态，直到安全检查点才变为已暂停。取消、失败、部分成功需要按实际 `status` 判断，不能仅因 HTTP 200 就认为视频分析成功。
+
+## 精简版网页与模型管理接口（2026-10-15）
+
+网页取消账号密码，业务 API 的 Bearer 令牌仍保留。以下接口均在 `/api/v1` 下：
+
+| 方法与路径 | 请求 | 返回 |
+|---|---|---|
+| GET `/local-models` | 无 | `models`、`running`、最近 10 个 `jobs`，不含内部路径 |
+| POST `/local-models/import` | `{"path":"D:/模型/a.gguf"}` | 202；后台操作 ID |
+| POST `/local-models/download` | `{"url":"https://.../a.gguf","sha256":"64位摘要"}` | 202；后台操作 ID |
+| POST `/local-models/runtime/cpu` 或 `/cuda` | 无 | 202；部署操作 ID |
+| POST `/local-models/{id}/start` | `{"gpu_layers":99,"context":8192}` | 健康检查后的运行状态 |
+| POST `/local-models/stop` | 无 | 仅停止受管且身份匹配的进程 |
+| DELETE `/local-models/{id}` | 无 | 删除模型副本，保留原始导入文件 |
+
+传输还可选填 `name`（显示名）。导入/下载作业由后台线程执行，状态为 `running/succeeded/failed`，含 `bytes/total/message`；作业列表是当前服务进程内进度，不作为视频任务检查点。模型库清单和已完成文件持久化。失败或重启后可重新提交。单文件最大 32 GiB。
+
+`installed` 表示原部署模型快照，允许启动，不允许网页删除共享快照；UUID 表示网页仓库的独立文件。分析/问答进行中返回 409，错误仍为统一的 `{error:{code,message}}` 结构。
+
+`/app/videolens-export/{video_id}/markdown` 为本机免登录下载入口，返回 UTF-8 `.md` 附件，同时在 `data/exports` 保存报告原件。云端密钥写接口只写入项目内 DPAPI 密文，不读回。

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import json
 import queue
 import shutil
@@ -19,7 +20,7 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from . import media
-from .config import SecretStore, Settings, atomic_json, load_settings
+from .config import SecretStore, Settings, atomic_json, check_storage_paths, load_settings
 from .errors import TaskInterrupted, VideoLensError
 from .generation import Composer, parse_object, validate_claims
 from .models import ModelGateway
@@ -41,6 +42,9 @@ def _public(value):
 
 class VideoService:
     def __init__(self, settings: Settings | None = None):
+        from .logging_setup import configure_logging
+        from .paths import configure_paths
+        configure_logging(configure_paths())
         self.settings = settings or load_settings()
         self._pending_settings: Settings | None = None
         self.data_dir = Path(self.settings.data_dir).resolve()
@@ -48,7 +52,7 @@ class VideoService:
         for part in ("videos", "tmp", "exports"):
             (self.data_dir / part).mkdir(exist_ok=True)
         self.store = Database(self.data_dir / "videolens.sqlite3")
-        self.secrets = SecretStore()
+        self.secrets = SecretStore(self.data_dir / "secrets")
         self.gateway = ModelGateway(self.settings, self.secrets.get)
         self.index = IndexManager(self.settings, self.store, self.gateway)
         self.composer = Composer(self.settings, self.gateway)
@@ -252,7 +256,14 @@ class VideoService:
                     if not job or job["status"] != "queued":
                         continue
                     self.store.update_job(identity, status="running")
-                self._run_task(identity)
+                from .logging_setup import task_context
+                token = task_context.set(identity)
+                try:
+                    logging.getLogger(__name__).info("开始分析任务")
+                    self._run_task(identity)
+                    logging.getLogger(__name__).info("任务结束：%s", self._job(identity)["status"])
+                finally:
+                    task_context.reset(token)
             finally:
                 self._queue.task_done()
 
@@ -290,6 +301,7 @@ class VideoService:
                 return old["value"]
             self.store.update_job(identity, stage=name, progress=progress)
             self.store.event(identity, "progress", {"stage": name, "progress": progress, "status": "running"})
+            logging.getLogger(__name__).info("执行阶段：%s，进度：%s", name, progress)
             started = time.monotonic()
             value = function()
             check()
@@ -497,6 +509,7 @@ class VideoService:
             session, history, recent, refs, chapters = self._conversation(session_id, question)
             yield {"event": "status", "data": {"message": "已检索证据，正在生成；流式草稿的引用将在完成时检查"}}
             raw, displayed = "", ""
+            logging.getLogger(__name__).info("开始流式问答，会话：%s", session_id)
             started = time.monotonic()
             first_token = None
             messages, selected = self.composer._messages(question, refs, recent, self.settings.answer_prompt, chapters)
@@ -644,7 +657,8 @@ class VideoService:
                 current[key] = {**current[key], **value} if isinstance(value, dict) and isinstance(current.get(key), dict) else value
             try:
                 updated = Settings(**current)
-            except ValidationError as exc:
+                check_storage_paths(updated)
+            except (ValidationError, ValueError) as exc:
                 raise VideoLensError("INVALID_SETTINGS", "配置字段或数值无效，请检查切片范围、路径及模型设置") from exc
             path = Path(self.settings.config_path or self.data_dir.parent / "config.local.json")
             atomic_json(path, updated.model_dump(exclude={"config_path"}))

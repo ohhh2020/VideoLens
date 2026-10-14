@@ -9,6 +9,8 @@ import argparse
 import fnmatch
 import hashlib
 import json
+import logging
+from uuid import uuid4
 import os
 import socket
 import subprocess
@@ -94,7 +96,7 @@ def download_models(settings: Settings, names: list[str]) -> dict:
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     for name in names:
         spec = MODEL_SPECS[name]
-        print(f"下载模型 [{name}] {spec['repo_id']} @ {spec['revision']}\n缓存目录：{cache}", flush=True)
+        logging.getLogger(__name__).info("下载模型 [%s] %s @ %s；缓存目录：%s", name, spec["repo_id"], spec["revision"], cache)
         # HfApi 返回每个大文件的官方 LFS 摘要，避免只计算本地哈希而没有对照来源。
         info = HfApi().model_info(spec["repo_id"], revision=spec["revision"], files_metadata=True)
         hashes = {}
@@ -104,7 +106,7 @@ def download_models(settings: Settings, names: list[str]) -> dict:
                 hashes[sibling.rfilename] = getattr(lfs, "sha256", None) or (lfs.get("sha256") if isinstance(lfs, dict) else None)
         selected_bytes = sum((getattr(item, "size", 0) or 0) for item in info.siblings or []
                              if any(fnmatch.fnmatch(item.rfilename, p) for p in spec["patterns"]))
-        print(f"选定文件约 {selected_bytes / 1024 ** 3:.2f} GiB；已缓存文件自动复用。", flush=True)
+        logging.getLogger(__name__).info(f"选定文件约 {selected_bytes / 1024 ** 3:.2f} GiB；已缓存文件自动复用。")
         snapshot = Path(snapshot_download(repo_id=spec["repo_id"], revision=spec["revision"],
                                          cache_dir=str(cache), allow_patterns=spec["patterns"], max_workers=4))
         files = []
@@ -137,7 +139,7 @@ def download_models(settings: Settings, names: list[str]) -> dict:
             manifest = read_json(manifest_path, {"schema": 1, "models": {}})
             manifest.setdefault("models", {})[name] = entry
             atomic_json(manifest_path, manifest)
-        print(f"[{name}] 下载与校验完成，共 {len(files)} 个文件。", flush=True)
+        logging.getLogger(__name__).info(f"[{name}] 下载与校验完成，共 {len(files)} 个文件。")
     return manifest
 
 
@@ -164,7 +166,7 @@ def download_file(url: str, target: Path, expected_sha256: str) -> None:
     if len(expected_sha256) != 64 or any(c not in "0123456789abcdef" for c in expected_sha256.lower()):
         raise ValueError("必须提供 64 位 SHA-256 校验值。")
     if target.exists() and sha256_file(target) == expected_sha256.lower():
-        print(f"复用已校验文件：{target.name}", flush=True)
+        logging.getLogger(__name__).info(f"复用已校验文件：{target.name}")
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".part")
@@ -189,7 +191,7 @@ def download_file(url: str, target: Path, expected_sha256: str) -> None:
                         output.write(chunk)
                         written += len(chunk)
                         if time.monotonic() - last_print >= 3:
-                            print(f"{target.name}: {written / 1024 ** 2:.1f}/{total / 1024 ** 2:.1f} MiB", flush=True)
+                            logging.getLogger(__name__).info(f"{target.name}: {written / 1024 ** 2:.1f}/{total / 1024 ** 2:.1f} MiB")
                             last_print = time.monotonic()
             actual = sha256_file(temporary)
             if actual != expected_sha256.lower():
@@ -239,7 +241,7 @@ def install_runtime(settings: Settings, variant: str, url: str | None, sha256: s
         for filename, digest in RUNTIME_PACKAGES[variant]:
             source = f"https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_RELEASE}/{filename}"
             package_path = runtime / "downloads" / filename
-            print(f"下载 llama.cpp {LLAMA_RELEASE}：{source}", flush=True)
+            logging.getLogger(__name__).info(f"下载 llama.cpp {LLAMA_RELEASE}：{source}")
             download_file(source, package_path, digest)
             packages.append({"path": str(package_path), "sha256": digest, "source": source})
     for package in packages:
@@ -349,24 +351,37 @@ def _start_local_locked(settings: Settings, owner: str, wait_seconds: float) -> 
                "--alias", settings.local_model, "--ctx-size", str(getattr(settings, "local_context_tokens", 8192)),
                "--n-gpu-layers", str(settings.llama_gpu_layers), "--parallel", "1",
                "--jinja", "--chat-template-kwargs", '{"enable_thinking":false}']
-    log_path = runtime / "llama-server.log"
-    with log_path.open("ab") as log:
-        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                                   creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-    identity = psutil.Process(process.pid)
-    record = {"pid": process.pid, "create_time": identity.create_time(), "executable": str(server.resolve()),
+    log_path = Path(settings.data_dir).parent / "logs/llama-server.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = runtime / ("llama-log-" + uuid4().hex + ".json")
+    atomic_json(descriptor, {"command": command, "log": str(log_path)})
+    relay = subprocess.Popen([sys.executable, "-m", "videolens.process_log", str(descriptor)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    ready = descriptor.with_suffix(".ready")
+    for _ in range(200):
+        if ready.is_file():
+            break
+        if relay.poll() is not None:
+            raise RuntimeError("本地模型日志进程启动失败")
+        time.sleep(0.1)
+    else:
+        relay.terminate()
+        raise RuntimeError("本地模型启动握手超时")
+    identity = psutil.Process(read_json(ready)["pid"])
+    record = {"pid": identity.pid, "create_time": identity.create_time(), "executable": str(server.resolve()),
               "model": str(model.resolve()), "owner": owner, "host": host, "port": port}
     atomic_json(record_path, record)
     try:
         deadline = time.monotonic() + wait_seconds
         with httpx.Client(timeout=3, trust_env=False) as client:
             while time.monotonic() < deadline:
-                if process.poll() is not None:
+                if not identity.is_running() or relay.poll() is not None:
                     raise RuntimeError(f"llama-server 提前退出，查看日志：{log_path}")
                 try:
                     response = client.get(f"http://[{host}]:{port}/health" if host == "::1" else f"http://{host}:{port}/health")
                     if response.status_code == 200:
-                        return {"status": "ready", "started": True, "pid": process.pid, "owner": owner}
+                        return {"status": "ready", "started": True, "pid": identity.pid, "owner": owner}
                 except httpx.HTTPError:
                     pass
                 time.sleep(0.5)
@@ -403,6 +418,9 @@ def main(argv: list[str] | None = None) -> int:
     for output in (sys.stdout, sys.stderr):
         if hasattr(output, "reconfigure"):
             output.reconfigure(encoding="utf-8")
+    from .logging_setup import configure_logging
+    from .paths import configure_paths
+    configure_logging(configure_paths())
     parser = argparse.ArgumentParser(description="知影模型下载、完整性校验及本地生成服务管理")
     parser.add_argument("--config", help="自定义配置 JSON 路径")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -441,7 +459,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except (Exception, KeyboardInterrupt) as exc:
-        print(f"部署操作未完成：{exc}", file=sys.stderr)
+        logging.getLogger(__name__).error("部署操作未完成：%s", type(exc).__name__)
         return 1
 
 

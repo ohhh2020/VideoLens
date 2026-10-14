@@ -110,6 +110,10 @@ class ModelGateway:
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
         directory = str(Path(self.settings.models_dir).resolve())
         offline = not self.settings.allow_model_download
+        if role in {"text", "image"}:
+            from transformers.utils import logging as transformers_logging
+            transformers_logging.disable_default_handler()
+            transformers_logging.enable_propagation()
         if role == "asr":
             from faster_whisper import WhisperModel
             self._model = WhisperModel(self._source("asr", self.settings.asr_model), device=device,
@@ -294,6 +298,17 @@ class ModelGateway:
         active: list[Any] = []
         payload = {"model": model, "messages": messages, "stream": True, "temperature": 0.2,
                    "max_tokens": getattr(self.settings, "output_tokens", 1536)}
+        host = urlparse(base_url).hostname or ""
+        # 新一代 OpenAI 模型使用 completion 预算，推理模式不接受 temperature。
+        # 仅针对官方主机调整，避免强行改变其他兼容平台的参数语义。
+        if host == "api.openai.com" and model.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4")):
+            payload["max_completion_tokens"] = payload.pop("max_tokens")
+            payload.pop("temperature")
+            payload["reasoning_effort"] = "none" if model.startswith(("gpt-6-luna", "gpt-6-sol")) else "low"
+        elif host.endswith("aliyuncs.com") and model.startswith("qwen"):
+            payload["enable_thinking"] = False
+        elif host == "api.deepseek.com":
+            payload["thinking"] = {"type": "disabled"}
         if key is None and urlparse(base_url).hostname in {"localhost", "127.0.0.1", "::1"}:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
 

@@ -6,17 +6,17 @@ if (-not (Get-VideoLensEnvironment $conda)) { throw '未找到 VideoLens 环境�
 $localStarted = $false
 $localOwner = [Guid]::NewGuid().ToString('N')
 try {
-    Invoke-Checked $conda @('run','--no-capture-output','-n','VideoLens','python','scripts/smoke_environment.py')
-    if ($CheckOnly) { Write-Host '启动前环境检查通过；检查模式不启动网页或模型进程。'; return }
+    Invoke-Checked $conda @('run','--no-capture-output','-p',$script:VideoLensPrefix,'python','scripts/smoke_environment.py')
+    if ($CheckOnly) { Write-ProjectLog '启动前环境检查通过；检查模式不启动网页或模型进程。'; return }
     if (-not $SkipLocal) {
         # 模型尚未部署时允许主程序启动，问答页面会明确显示基础摘录降级。
-        & $conda run --no-capture-output -n VideoLens python -m videolens.bootstrap start-local --owner $localOwner
+        & $conda run --no-capture-output -p $script:VideoLensPrefix python -m videolens.bootstrap start-local --owner $localOwner
         $localStarted = ($LASTEXITCODE -eq 0)
-        if (-not $localStarted) { Write-Warning '本地生成模型未就绪；继续启动网页，可在部署后重试。' }
+        if (-not $localStarted) { Write-ProjectLog -Level 'WARNING' '本地生成模型未就绪；继续启动网页，可在部署后重试。' }
     }
-    $serveArgs = @('run','--no-capture-output','-n','VideoLens','python','-m','videolens.cli','serve')
+    $serveArgs = @('run','--no-capture-output','-p',$script:VideoLensPrefix,'python','-m','videolens.cli','serve')
     if (-not $NoBrowser) { $serveArgs += '--open-browser' }
     Invoke-Checked $conda $serveArgs
 } finally {
-    if ($localStarted) { & $conda run --no-capture-output -n VideoLens python -m videolens.bootstrap stop-local --owner $localOwner }
+    if ($localStarted) { & $conda run --no-capture-output -p $script:VideoLensPrefix python -m videolens.bootstrap stop-local --owner $localOwner }
 }

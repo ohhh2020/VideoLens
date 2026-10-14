@@ -15,7 +15,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .errors import VideoLensError
+from .secrets import SecretStore as SecretStore  # 兼容旧导入入口。
 
 
 # 生成接口除了正文还包含角色、消息边界等控制标记；保留固定安全空间。
@@ -90,8 +90,13 @@ class Settings(BaseModel):
     summary_prompt: str = "请概括视频的核心内容、重要结论和时间线，每条结论都引用原始证据。"
     answer_prompt: str = "请仅依据提供的视频证据回答；信息不足时说明，不编造事实。"
     api_token: str = Field(default="", exclude=True)
-    ui_username: str = "videolens"
-    ui_password: str = Field(default="", exclude=True)
+    @model_validator(mode="before")
+    @classmethod
+    def remove_legacy_login(cls, data):
+        # 读取旧配置时丢弃已经取消的登录字段；新配置不再保存账号或密码。
+        if isinstance(data, dict):
+            data = {k: v for k, v in data.items() if k not in {"ui_username", "ui_password"}}
+        return data
 
     @model_validator(mode="after")
     def validate_ranges(self):
@@ -147,6 +152,20 @@ def project_root() -> Path:
     return Path(os.environ.get("VIDEOLENS_ROOT", Path(__file__).resolve().parents[2]))
 
 
+def check_storage_paths(settings: Settings) -> None:
+    """拒绝把应用输出和运行依赖配置到项目外；用户输入源文件仍可在别处。"""
+    root = project_root().resolve()
+    base = Path(settings.config_path).parent if settings.config_path else root
+    for name in ("data_dir", "models_dir", "runtime_dir", "llama_model_path", "llama_server_path"):
+        value = getattr(settings, name)
+        if not value:
+            continue
+        path = Path(value)
+        resolved = (base / path).resolve() if not path.is_absolute() else path.resolve()
+        if not resolved.is_relative_to(root):
+            raise ValueError(f"{name} 必须位于 VideoLens 项目目录内")
+
+
 def atomic_json(path: Path, data: object) -> None:
     """先写临时文件再替换，避免断电留下半个 JSON。"""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,6 +183,7 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
         value = Path(data.get(key, key.removesuffix("_dir")))
         data[key] = str((path.parent / value).resolve() if not value.is_absolute() else value.resolve())
     settings = Settings(**data)
+    check_storage_paths(settings)
     settings.api_token = os.environ.get("VIDEOLENS_API_TOKEN", "")
     if not settings.api_token:
         token_file = Path(settings.data_dir) / ".access-token"
@@ -178,34 +198,4 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
             except FileExistsError:
                 pass
         settings.api_token = token_file.read_text(encoding="utf-8").strip()
-    settings.ui_password = settings.api_token
     return settings
-
-
-class SecretStore:
-    """系统凭据库不可用时拒绝明文落盘，用户仍可通过环境变量注入密钥。"""
-
-    @staticmethod
-    def get(ref: str) -> str | None:
-        if not ref:
-            return None
-        key = "VIDEOLENS_KEY_" + "".join(c if c.isalnum() else "_" for c in ref).upper()
-        if os.environ.get(key):
-            return os.environ[key]
-        try:
-            import keyring
-
-            return keyring.get_password("VideoLens", ref)
-        except Exception:
-            return None
-
-    @staticmethod
-    def set(ref: str, value: str) -> None:
-        if not ref or len(ref) > 100 or not value:
-            raise VideoLensError("INVALID_KEY", "凭据名称与密钥不能为空")
-        try:
-            import keyring
-
-            keyring.set_password("VideoLens", ref, value)
-        except Exception as exc:
-            raise VideoLensError("KEYSTORE_UNAVAILABLE", "系统凭据库不可用，请使用后端环境变量配置密钥", 503) from exc

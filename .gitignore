@@ -1,5 +1,7 @@
 # 本地环境、模型和用户数据绝不进入版本库。
 .venv/
+envs/
+cache/
 __pycache__/
 *.py[cod]
 *.egg-info/
