@@ -1,0 +1,10 @@
+# 首次创建使用此文件；一键脚本优先复用同名环境，不写入 base。
+name: VideoLens
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - pip
+  - ffmpeg>=7
+  - pip:
+      - -e .[heavy,dev]

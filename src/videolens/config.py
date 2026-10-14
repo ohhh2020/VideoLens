@@ -18,8 +18,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .errors import VideoLensError
 
 
+# 生成接口除了正文还包含角色、消息边界等控制标记；保留固定安全空间。
+GENERATION_SAFETY_TOKENS = 512
+MIN_GENERATION_INPUT_TOKENS = 256
+
+
 class Provider(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_default=True)
     enabled: bool = False
     name: str = "自定义服务"
     base_url: str = ""
@@ -32,7 +37,8 @@ class Provider(BaseModel):
 class Settings(BaseModel):
     """单位直接写在字段名中，避免把秒当毫秒、把字节当 MB。"""
 
-    model_config = ConfigDict(extra="forbid")
+    # 默认的 20 和反序列化后的 20.0 应具有相同指纹，统一按字段类型校验默认值。
+    model_config = ConfigDict(extra="forbid", validate_default=True)
     config_path: str = ""
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1024, le=65535)
@@ -93,6 +99,18 @@ class Settings(BaseModel):
             raise ValueError("切片最小值、目标值、最大值必须按顺序递增")
         if self.text_weight + self.image_weight + self.keyword_weight <= 0:
             raise ValueError("检索权重不能全部为零")
+        contexts = []
+        if self.local_enabled:
+            contexts.append(("本地生成模型", self.local_context_tokens))
+        if self.cloud_enabled:
+            if self.text_provider.enabled:
+                contexts.append(("云端文本模型", self.text_provider.context_tokens))
+            if self.vision_provider.enabled:
+                contexts.append(("云端视觉模型", self.vision_provider.context_tokens))
+        required = self.output_tokens + GENERATION_SAFETY_TOKENS + MIN_GENERATION_INPUT_TOKENS
+        for name, capacity in contexts:
+            if required > capacity:
+                raise ValueError(f"{name}上下文过小：至少需要输出预算 {self.output_tokens} + 安全空间 {GENERATION_SAFETY_TOKENS} + 最小输入空间 {MIN_GENERATION_INPUT_TOKENS} = {required} tokens")
         # 首版本地服务不提供公网部署；远程接入需在后续显式配置 HTTPS。
         if self.host not in ("127.0.0.1", "localhost", "::1"):
             raise ValueError("首版服务仅支持本机回环地址")
@@ -101,7 +119,28 @@ class Settings(BaseModel):
     def fingerprint(self) -> str:
         """仅对影响分析产物的设置取指纹，令牌、端口不会使分析缓存失效。"""
         data = self.model_dump(exclude={"config_path", "host", "port", "ui_username"})
+        data["model_versions"] = self.model_versions()
         return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    def model_versions(self) -> dict[str, str]:
+        """同名模型升级权重也必须重建产物；快照目录的位置不代表模型版本。
+
+        使用安装清单中的 revision 和逐文件校验值识别已安装权重，避免每次查询
+        都重新读取数 GB 模型。文件完整性由部署校验负责，版本兼容性由此处负责。
+        """
+        path = Path(self.models_dir) / "model-manifest.json"
+        if not path.is_file():
+            return {}
+        try:
+            entries = json.loads(path.read_text(encoding="utf-8"))["models"]
+            result = {}
+            for role, item in entries.items():
+                identity = {"repo_id": item.get("repo_id"), "revision": item.get("revision"),
+                            "files": sorted((file["path"], file["sha256"]) for file in item.get("files", []))}
+                result[role] = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+            return result
+        except (OSError, ValueError, KeyError, TypeError):
+            return {"manifest": "invalid"}
 
 
 def project_root() -> Path:

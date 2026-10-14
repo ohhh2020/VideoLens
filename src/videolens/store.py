@@ -111,6 +111,10 @@ class Database:
             row = db.execute("SELECT payload FROM checkpoints WHERE job_id=? AND stage=?", (job_id, stage)).fetchone()
             return json.loads(row[0]) if row else None
 
+    def clear_checkpoints(self, job_id, stages):
+        with self.lock, self.connect() as db:
+            db.executemany("DELETE FROM checkpoints WHERE job_id=? AND stage=?", [(job_id, stage) for stage in stages])
+
     def _replace_items(self, table, video_id, items):
         with self.lock, self.connect() as db:
             db.execute(f"DELETE FROM {table} WHERE video_id=?", (video_id,))
@@ -175,3 +179,16 @@ class Database:
                 db.execute(f"DELETE FROM {table} WHERE video_id=?", (video_id,))
             db.execute("DELETE FROM videos WHERE id=?", (video_id,))
             db.execute("DELETE FROM metadata WHERE key=?", ("index:" + video_id,))
+
+    def commit_analysis(self, video, clips, frames, index_meta=None):
+        """一次事务发布整代证据和报告，失败/取消的重分析不会破坏旧报告引用。"""
+        with self.lock, self.connect() as db:
+            for table, items in (("clips", clips), ("frames", frames)):
+                db.execute(f"DELETE FROM {table} WHERE video_id=?", (video["id"],))
+                db.executemany(f"INSERT INTO {table} VALUES(?,?,?)", [(item["id"], video["id"], self.encode(item)) for item in items])
+            db.execute("UPDATE videos SET payload=? WHERE id=?", (self.encode(video), video["id"]))
+            if index_meta:
+                db.execute("INSERT INTO metadata VALUES(?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload", ("index:" + video["id"], self.encode(index_meta)))
+            else:
+                # 新证据不能继续搭配旧向量；没有新向量时安全降级关键词检索。
+                db.execute("DELETE FROM metadata WHERE key=?", ("index:" + video["id"],))
