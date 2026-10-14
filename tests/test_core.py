@@ -296,3 +296,21 @@ def test_settings_fingerprint_survives_database_json_roundtrip(tmp_path):
     original = Settings(models_dir=str(tmp_path / "models"))
     restored = Settings(**json.loads(original.model_dump_json()))
     assert original.fingerprint() == restored.fingerprint()
+
+
+def test_pending_restart_settings_survive_later_prompt_edit(service):
+    old_port = service.settings.port
+    result = service.update_settings({"port": old_port + 1})
+    assert result["restart_required"] and result["settings"]["port"] == old_port + 1
+    assert service.settings.port == old_port, "当前监听在重启之前不能悄悄改变"
+    result = service.update_settings({"answer_prompt": "仅根据原文简明回答"})
+    saved = json.loads(Path(service.settings.config_path).read_text(encoding="utf-8"))
+    assert saved["port"] == old_port + 1 and result["restart_required"]
+    assert service.public_settings()["port"] == old_port + 1
+
+
+def test_llama_launch_settings_require_restart(service):
+    result = service.update_settings({"llama_gpu_layers": 99})
+    assert result["restart_required"]
+    assert service.settings.llama_gpu_layers == 0
+    assert result["settings"]["llama_gpu_layers"] == 99

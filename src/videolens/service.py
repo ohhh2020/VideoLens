@@ -42,6 +42,7 @@ def _public(value):
 class VideoService:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or load_settings()
+        self._pending_settings: Settings | None = None
         self.data_dir = Path(self.settings.data_dir).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         for part in ("videos", "tmp", "exports"):
@@ -59,7 +60,7 @@ class VideoService:
         self._sessions: dict[str, threading.Lock] = {}
         self._last_cleanup = 0.0
 
-    def start(self):
+    def start(self) -> None:
         if self._threads:
             return
         self._stop.clear()
@@ -77,7 +78,7 @@ class VideoService:
             worker.start()
             self._threads.append(worker)
 
-    def close(self):
+    def close(self) -> None:
         self._stop.set()
         for _ in self._threads:
             self._queue.put(None)
@@ -105,7 +106,7 @@ class VideoService:
         if shutil.disk_usage(self.data_dir).free < incoming + 256 * 1024 ** 2:
             raise VideoLensError("DISK_FULL", "磁盘可用空间不足，请清理后重试", 507)
 
-    def import_file(self, path: Path, subtitle: Path | None = None):
+    def import_file(self, path: Path, subtitle: Path | None = None) -> dict:
         path = Path(path).resolve()
         if not path.is_file() or path.suffix.lower() not in {".mp4", ".mkv", ".avi", ".mov"}:
             raise VideoLensError("INVALID_MEDIA", "请选择存在的 MP4、MKV、AVI 或 MOV 文件")
@@ -150,7 +151,7 @@ class VideoService:
                 raise
         return _public(value)
 
-    def import_url(self, url: str):
+    def import_url(self, url: str) -> dict:
         parsed = urlparse(url)
         if len(url) > 2048 or parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username:
             raise VideoLensError("INVALID_URL", "请输入合法的 HTTP/HTTPS 视频链接（最长 2048 字符）")
@@ -162,15 +163,15 @@ class VideoService:
         self.store.save_video(value)
         return _public(value)
 
-    def list_videos(self):
+    def list_videos(self) -> list[dict]:
         return [_public(v) for v in self.store.list_videos()]
 
-    def get_video(self, video_id):
+    def get_video(self, video_id: str) -> dict:
         value = self._video(video_id)
         return {**_public(value), "clips": [{**c, "start_time": timestamp(c["start_ms"]), "end_time": timestamp(c["end_ms"])} for c in self.store.clips(video_id)],
                 "frames": [public_frame(f) for f in self.store.frames(video_id)]}
 
-    def create_task(self, video_id, kind="analyze"):
+    def create_task(self, video_id: str, kind: str = "analyze") -> dict:
         video = self._video(video_id)
         if kind not in {"analyze", "reindex"}:
             raise VideoLensError("INVALID_TASK", "任务类型必须为 analyze 或 reindex")
@@ -192,13 +193,13 @@ class VideoService:
             self._queue.put(identity)
             return _public(value)
 
-    def get_task(self, identity):
+    def get_task(self, identity: str) -> dict:
         return _public(self._job(identity))
 
-    def list_tasks(self):
+    def list_tasks(self) -> list[dict]:
         return [_public(j) for j in self.store.list_jobs()]
 
-    def control_task(self, identity, action):
+    def control_task(self, identity: str, action: str) -> dict:
         with self._guard:
             job = self._job(identity)
             status = job["status"]
@@ -218,7 +219,7 @@ class VideoService:
                 self._queue.put(identity)
             return _public(result)
 
-    def task_events(self, identity, after=0):
+    def task_events(self, identity: str, after: int = 0) -> list[dict]:
         self._job(identity)
         return self.store.events(identity, after)
 
@@ -414,22 +415,22 @@ class VideoService:
             if locked:
                 self._inference.release()
 
-    def search(self, video_id, query="", image_path=None):
+    def search(self, video_id: str, query: str = "", image_path: Path | None = None) -> list[dict]:
         self._video(video_id)
         if len(query) > 500 or (not query.strip() and image_path is None):
             raise VideoLensError("INVALID_QUERY", "请输入 1—500 字的问题，或提供检索图片")
         with self._inference:
             return self.index.search(video_id, query, image_path)
 
-    def create_session(self, video_id):
+    def create_session(self, video_id: str) -> dict:
         self._video(video_id)
         return self.store.create_session(video_id)
 
-    def list_sessions(self, video_id):
+    def list_sessions(self, video_id: str) -> list[dict]:
         self._video(video_id)
         return self.store.list_sessions(video_id)
 
-    def session_messages(self, session_id):
+    def session_messages(self, session_id: str) -> list[dict]:
         if not self.store.get_session(session_id):
             raise VideoLensError("SESSION_NOT_FOUND", "会话不存在", 404)
         return self.store.messages(session_id)
@@ -474,7 +475,7 @@ class VideoService:
             session["summary"] = "\n".join(f"{item['role']}：{item['content'][:160]}" for item in older[-12:])[:1800]
             self.store.update_session(session)
 
-    def ask(self, session_id, question):
+    def ask(self, session_id: str, question: str) -> dict:
         lock = self._sessions.setdefault(session_id, threading.Lock())
         with lock, self._inference:
             session, history, recent, refs, chapters = self._conversation(session_id, question)
@@ -536,7 +537,7 @@ class VideoService:
             finally:
                 self.gateway.release()
 
-    def export(self, video_id, fmt):
+    def export(self, video_id: str, fmt: str) -> str:
         video = self.get_video(video_id)
         report = video.get("report")
         if not report:
@@ -547,7 +548,7 @@ class VideoService:
             return json.dumps(video, ensure_ascii=False, indent=2)
         raise VideoLensError("INVALID_FORMAT", "导出格式仅支持 markdown 或 json")
 
-    def media_path(self, video_id, frame_id=None):
+    def media_path(self, video_id: str, frame_id: str | None = None) -> Path:
         video = self._video(video_id)
         if frame_id:
             item = next((f for f in self.store.frames(video_id) if f["id"] == frame_id), None)
@@ -567,7 +568,7 @@ class VideoService:
         elif path.exists():
             path.unlink()
 
-    def delete_video(self, video_id):
+    def delete_video(self, video_id: str) -> dict:
         self._video(video_id)
         with self._guard, self._inference:
             if any(j["video_id"] == video_id and j["status"] in ACTIVE for j in self.store.list_jobs()):
@@ -580,7 +581,7 @@ class VideoService:
             self.store.delete_video(video_id)
         return {"deleted": video_id}
 
-    def cleanup(self):
+    def cleanup(self) -> dict[str, int]:
         now = time.time()
         cleaned = {"media": 0, "temporary": 0, "videos": 0}
         jobs = self.store.list_jobs()
@@ -614,10 +615,11 @@ class VideoService:
                     cleaned["temporary"] += 1
         return cleaned
 
-    def public_settings(self):
-        data = self.settings.model_dump(exclude={"config_path"})
+    def public_settings(self) -> dict:
+        visible = self._pending_settings or self.settings
+        data = visible.model_dump(exclude={"config_path"})
         # 默认路径以相对路径展示，避免公开响应泄露本机用户名和内部绝对路径。
-        root = Path(self.settings.config_path).parent if self.settings.config_path else self.data_dir.parent
+        root = Path(visible.config_path).parent if visible.config_path else self.data_dir.parent
         for key in ("data_dir", "models_dir", "runtime_dir"):
             path = Path(data[key])
             if path.is_relative_to(root):
@@ -629,13 +631,15 @@ class VideoService:
                 data[key] = Path(data[key]).name
         return data
 
-    def update_settings(self, patch):
+    def update_settings(self, patch: dict) -> dict:
         if any(k in patch for k in ("api_token", "ui_password", "config_path")):
             raise VideoLensError("READONLY_SETTING", "不能通过普通设置修改访问凭据")
         with self._guard, self._inference:
             if any(j["status"] in ACTIVE for j in self.store.list_jobs()):
                 raise VideoLensError("TASK_ACTIVE", "修改设置前请暂停或等待当前任务完成", 409)
-            current = self.settings.model_dump()
+            # 用户尚未重启时可能继续编辑提示词。以最近保存的待生效配置为基准，
+            # 避免第二次保存把第一次设置的新目录、端口等覆盖回旧值。
+            current = (self._pending_settings or self.settings).model_dump()
             for key, value in patch.items():
                 current[key] = {**current[key], **value} if isinstance(value, dict) and isinstance(current.get(key), dict) else value
             try:
@@ -644,18 +648,21 @@ class VideoService:
                 raise VideoLensError("INVALID_SETTINGS", "配置字段或数值无效，请检查切片范围、路径及模型设置") from exc
             path = Path(self.settings.config_path or self.data_dir.parent / "config.local.json")
             atomic_json(path, updated.model_dump(exclude={"config_path"}))
-            restart_fields = {"host", "port", "data_dir", "models_dir", "runtime_dir", "analysis_concurrency"}
+            restart_fields = {"host", "port", "data_dir", "models_dir", "runtime_dir", "analysis_concurrency",
+                              "local_enabled", "local_base_url", "local_model", "llama_server_path",
+                              "llama_model_path", "llama_gpu_layers", "local_context_tokens"}
             restart = any(getattr(updated, key) != getattr(self.settings, key) for key in restart_fields)
+            self._pending_settings = updated if restart else None
             for key in Settings.model_fields:
                 if key not in restart_fields | {"api_token", "ui_password", "config_path"}:
                     setattr(self.settings, key, getattr(updated, key))
             self.gateway.release()
             return {"settings": self.public_settings(), "restart_required": restart}
 
-    def store_key(self, ref, key):
+    def store_key(self, ref: str, key: str) -> None:
         self.secrets.set(ref, key)
 
-    def check_provider(self, kind):
+    def check_provider(self, kind: str) -> dict:
         if kind not in {"text", "vision", "local"}:
             raise VideoLensError("INVALID_PROVIDER", "未知模型服务类型")
         import httpx
