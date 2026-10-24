@@ -1,224 +1,190 @@
-"""媒体测试使用真实字幕与 FFmpeg；未安装工具时明确跳过真实媒体测试。"""
+"""scene_detect 模块自检。"""
+
 from __future__ import annotations
 
-import shutil
-import subprocess
+import json
 import sys
 import time
-import hashlib
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from types import SimpleNamespace
+from pathlib import Path
 
-import pytest
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from videolens.media import MediaError, _run, download, extract_audio, extract_frames, find_subtitles, make_clips, probe, read_subtitles
+from core.media.scene_detect import (  # noqa: E402
+    SceneDetectConfig,
+    SceneDetector,
+    group_by_clip,
+    ms_to_timecode,
+)
+from fixtures import ensure as ensure_fixtures  # noqa: E402
 
+VIDEO, LOW = ensure_fixtures()
+OUT = Path(__file__).with_name("media") / "frames"
 
-def settings(**changes):
-    values = dict(ffmpeg="ffmpeg", ffprobe="ffprobe", max_video_bytes=4_000_000_000,
-                  max_video_seconds=7200, subtitle_language="zh", clip_target_seconds=20,
-                  clip_min_seconds=10, clip_max_seconds=30, frames_per_clip=3,
-                  frame_max_bytes=200000, scene_threshold=0.3, allow_video_download=True)
-    values.update(changes)
-    return SimpleNamespace(**values)
-
-
-def test_srt_chinese_html_and_duplicate(tmp_path):
-    path = tmp_path / "中文 & 字幕.srt"
-    path.write_text("1\n00:00:01,250 --> 00:00:03,500\n<b>你好</b> &amp; 世界\n\n2\n00:00:01,250 --> 00:00:03,500\n<b>你好</b> &amp; 世界\n", encoding="utf-8")
-    assert read_subtitles(path) == [{"id": "s000001", "start_ms": 1250, "end_ms": 3500, "text": "你好 & 世界"}]
+ok: list[str] = []
+fail: list[str] = []
 
 
-def test_vtt_settings_and_short_timestamp(tmp_path):
-    path = tmp_path / "字幕.vtt"
-    path.write_text("WEBVTT\n\nlabel\n00:01.000 --> 00:02.500 align:start\n<v 说话人>第一行</v>\n第二行\n\n", encoding="utf-8")
-    assert read_subtitles(path)[0] == {"id": "s000001", "start_ms": 1000, "end_ms": 2500, "text": "第一行 第二行"}
+def check(name: str, cond: bool, detail: str = "") -> None:
+    if cond:
+        ok.append(name)
+        print(f"PASS {name}" + (f" | {detail}" if detail else ""))
+    else:
+        fail.append(name)
+        print(f"FAIL {name}" + (f" | {detail}" if detail else ""))
 
 
-def test_ass_format_and_comma_inside_text(tmp_path):
-    path = tmp_path / "字幕.ass"
-    path.write_text("[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.25,0:00:04.20,Default,,0,0,0,,{\\b1}第一行\\N第二行,逗号\n", encoding="utf-8")
-    assert read_subtitles(path)[0]["text"] == "第一行 第二行,逗号"
-    assert read_subtitles(path)[0]["end_ms"] == 4200
+# 1) probe
+detector = SceneDetector(SceneDetectConfig(max_workers=4))
+info = detector.probe(VIDEO)
+check("probe 时长", 39_000 <= info.duration_ms <= 41_000, f"{info.duration_ms}ms")
+check("probe 分辨率", (info.display_width, info.display_height) == (1280, 720), f"{info.display_width}x{info.display_height}")
+check("probe fps", 24.0 <= info.fps <= 26.0, f"{info.fps}")
+check("probe 音轨", info.has_audio is True)
+check("短边 720", info.short_side == 720)
+
+# 2) 场景检测（scenedetect）
+t0 = time.monotonic()
+scenes, used, degraded = detector.detect_scenes(VIDEO, probe=info)
+elapsed = time.monotonic() - t0
+check("检测到 4 个场景", len(scenes) == 4, f"{len(scenes)} 段, {elapsed:.2f}s, detector={used}")
+if len(scenes) == 4:
+    bounds = [(s.start_ms, s.end_ms) for s in scenes]
+    expected = [(0, 10_000), (10_000, 20_000), (20_000, 30_000), (30_000, 40_000)]
+    drift = max(abs(a[0] - b[0]) for a, b in zip(bounds, expected))
+    check("切点误差 <200ms", drift < 200, f"最大偏移 {drift}ms")
+    check("场景首尾覆盖完整", bounds[0][0] == 0 and abs(bounds[-1][1] - info.duration_ms) <= 30,
+          f"{bounds[0][0]}~{bounds[-1][1]}")
+check("检测器为 scenedetect", used.startswith("scenedetect"), used)
+
+# 3) ffmpeg 降级链路
+ff_scenes, ff_used, ff_degraded = SceneDetector(SceneDetectConfig(detector="ffmpeg")).detect_scenes(VIDEO, probe=info)
+check("ffmpeg 降级可用", ff_used == "ffmpeg:scene" and len(ff_scenes) >= 3, f"{len(ff_scenes)} 段 via {ff_used}")
+
+# 4) fixed 降级
+fixed = SceneDetector(SceneDetectConfig(detector="fixed", fixed_scene_ms=10_000))
+fx_scenes, fx_used, _ = fixed.detect_scenes(VIDEO, probe=info)
+check("fixed 等分可用", fx_used == "fixed" and len(fx_scenes) == 4, f"{len(fx_scenes)} 段")
+
+# 5) 抽帧主流程
+import tempfile as _tempfile  # noqa: PLC0415
+
+_probe_before = len(list(Path(_tempfile.gettempdir()).glob("zhiying-kf-*")))
+t0 = time.monotonic()
+report = detector.extract_keyframes(VIDEO, video_id="demo", out_dir=OUT)
+cost = time.monotonic() - t0
+kfs = report.keyframes
+check("关键帧数量 4~8", 4 <= len(kfs) <= 8, f"{len(kfs)} 张, {cost:.2f}s")
+check("每场景至少 1 帧", all(len(report.frames_for_scene(i)) >= 1 for i in range(len(scenes))),
+      str([(i, len(report.frames_for_scene(i))) for i in range(len(scenes))]))
+check("每场景最多 2 帧", all(len(report.frames_for_scene(i)) <= 2 for i in range(len(scenes))))
+check("全部 ≤200KB", all(kf.size_bytes <= 200 * 1024 for kf in kfs),
+      f"最大 {max(kf.size_bytes for kf in kfs)}B")
+check("全部短边 ≥720", all(kf.short_side >= 720 for kf in kfs),
+      f"最小 {min(kf.short_side for kf in kfs)}px")
+check("文件真实存在", all(kf.path.is_file() and kf.path.stat().st_size == kf.size_bytes for kf in kfs))
+check("时间戳单调递增", all(kfs[i].timestamp_ms <= kfs[i + 1].timestamp_ms for i in range(len(kfs) - 1)))
+check("时间戳落在场景内", all(
+    any(s.start_ms <= kf.timestamp_ms <= s.end_ms for s in scenes) for kf in kfs))
+check("溯源字段完整", all(kf.video_id == "demo" and kf.keyframe_id for kf in kfs))
+check("黑屏场景触发模糊降级", any("偏模糊" in w or "清晰度阈值" in w for w in report.warnings),
+      " | ".join(report.warnings)[:160])
+check("候选数 ≥ 关键帧数", report.candidate_count >= len(kfs), f"{report.candidate_count} 候选")
+check("报告可序列化", bool(json.dumps(report.to_dict(), ensure_ascii=False)))
+# 探针目录：本轮抽帧结束后不应新增残留（对比运行前快照，历史遗留不算账）
+_probe_after = list(Path(_tempfile.gettempdir()).glob("zhiying-kf-*"))
+check("探针目录已清理", len(_probe_after) <= _probe_before,
+      f"运行前 {_probe_before} 个，运行后 {len(_probe_after)} 个")
+
+# 6) 清晰度排序：黑屏帧方差应远小于图案帧
+dark = [kf for kf in kfs if kf.scene_index == 3]
+bright = [kf for kf in kfs if kf.scene_index in (0, 1, 2)]
+if dark and bright:
+    check("黑屏帧清晰度更低", max(k.sharpness for k in dark) < min(k.sharpness for k in bright),
+          f"dark={max(k.sharpness for k in dark):.1f} vs bright={min(k.sharpness for k in bright):.1f}")
+
+# 7) clip 绑定
+clips = [("demo-c0000", 0, 10_000), ("demo-c0001", 10_000, 20_000),
+         ("demo-c0002", 20_000, 30_000), ("demo-c0003", 30_000, 40_000)]
+bound = SceneDetector.bind_clips(kfs, clips)
+check("clip 绑定成功", all(kf.clip_id for kf in bound), str([kf.clip_id for kf in bound]))
+grouped = group_by_clip(bound)
+check("按 clip 聚合", sum(len(v) for v in grouped.values()) == len(bound), str({k: len(v) for k, v in grouped.items()}))
+
+# 8) 低分辨率源：应给警告但不放大
+low = LOW
+if low.is_file():
+    low_detector = SceneDetector(SceneDetectConfig(detector="fixed", fixed_scene_ms=5_000))
+    low_report = low_detector.extract_keyframes(low, video_id="low", out_dir=OUT / "low")
+    check("低分辨率不放大", all(kf.short_side <= 480 for kf in low_report.keyframes),
+          f"{[(kf.width, kf.height) for kf in low_report.keyframes][:2]}")
+    check("低分辨率有警告", any("低于关键帧" in w for w in low_report.warnings), " | ".join(low_report.warnings)[:120])
+
+# 9) 非法参数
+raised = False
+try:
+    SceneDetectConfig(frames_per_scene=0).validate()
+except ValueError:
+    raised = True
+check("拒绝非法配置", raised)
+
+# 10) 时间格式
+check("毫秒时间码", ms_to_timecode(3_723_456) == "01:02:03.456", ms_to_timecode(3_723_456))
+
+# 11) 候选去重：宁可漏判，不可把真换页删掉
+_dedupe = SceneDetector(SceneDetectConfig())
+_side = _dedupe._cfg.dedupe_probe_side
+_dtmp = OUT / "dedupe"
+_dtmp.mkdir(parents=True, exist_ok=True)
 
 
-def test_empty_or_invalid_cues_are_skipped(tmp_path):
-    path = tmp_path / "空.srt"
-    path.write_text("1\n00:00:02,000 --> 00:00:01,000\n倒序\n\n2\n00:00:04,000 --> 00:00:05,000\n   \n", encoding="utf-8")
-    assert read_subtitles(path) == []
+def _flat(path: Path, color, label: str = "") -> Path:
+    from PIL import Image, ImageDraw, ImageFont
+
+    img = Image.new("RGB", (640, 360), color)
+    if label:
+        draw = ImageDraw.Draw(img)
+        try:
+            base = ImageFont.truetype(r"C:\Windows\Fonts\msyh.ttc", 60)
+        except Exception:
+            base = ImageFont.load_default()
+        draw.text((80, 120), label, font=base, fill=(0, 0, 0))
+    img.save(path, "PNG")
+    return path
 
 
-def test_clips_cover_silent_video_without_gaps():
-    clips = make_clips([], 95000, settings())
-    assert clips[0]["start_ms"] == 0
-    assert clips[-1]["end_ms"] == 95000
-    assert all(a["end_ms"] == b["start_ms"] for a, b in zip(clips, clips[1:]))
-    assert all(0 < c["end_ms"] - c["start_ms"] <= 30000 for c in clips)
-    assert len({c["id"] for c in clips}) == len(clips)
+_red = _flat(_dtmp / "red.png", (220, 30, 30))
+_blue = _flat(_dtmp / "blue.png", (30, 30, 220))
+_red2 = _flat(_dtmp / "red2.png", (218, 32, 29))
+_p1 = _flat(_dtmp / "p1.png", (250, 250, 252), "01")
+_p2 = _flat(_dtmp / "p2.png", (250, 250, 252), "02")
 
+check("去重指纹尺寸", _dedupe._fingerprint(_red)[0].shape == (_side, _side), f"{_side}x{_side}")
+check(
+    "纯红 vs 纯蓝 不判重",
+    not _dedupe._is_duplicate(_dedupe._fingerprint(_red), _dedupe._fingerprint(_blue)),
+    "纯色 aHash 完全相同，全靠平均色区分",
+)
+check(
+    "纯红 vs 红2 判重",
+    _dedupe._is_duplicate(_dedupe._fingerprint(_red), _dedupe._fingerprint(_red2)),
+)
+check(
+    "01 vs 02 不判重",
+    not _dedupe._is_duplicate(_dedupe._fingerprint(_p1), _dedupe._fingerprint(_p2)),
+)
+check(
+    "同一张图 判重",
+    _dedupe._is_duplicate(_dedupe._fingerprint(_p1), _dedupe._fingerprint(_p1)),
+)
+check(
+    "去重可整体关闭",
+    SceneDetector(SceneDetectConfig(dedupe_frames=False))._cfg.dedupe_frames is False,
+)
 
-def test_clips_prefer_sentence_boundary_and_preserve_evidence():
-    segments = [{"id": "s000001", "start_ms": 1000, "end_ms": 18500, "text": "一个完整句子。"},
-                {"id": "s000002", "start_ms": 19000, "end_ms": 35000, "text": "下一句话。"}]
-    clips = make_clips(segments, 60000, settings())
-    assert clips[0]["end_ms"] == 18500
-    assert clips[0]["segment_ids"] == ["s000001"]
-    assert set(sum((c["segment_ids"] for c in clips), [])) == {"s000001", "s000002"}
-
-
-def test_cancel_terminates_subprocess_quickly():
-    class Cancelled(Exception):
-        pass
-    started = time.monotonic()
-    def check():
-        if time.monotonic() - started > 0.3:
-            raise Cancelled()
-    with pytest.raises(Cancelled):
-        _run([sys.executable, "-c", "import time; time.sleep(20)"], check)
-    assert time.monotonic() - started < 4
-
-
-def test_subprocess_errors_hide_private_paths():
-    with pytest.raises(MediaError) as caught:
-        _run([sys.executable, "-c", "import sys; print('secret=PRIVATE', file=sys.stderr); sys.exit(3)"])
-    assert "PRIVATE" not in str(caught.value)
-    assert "3" in str(caught.value)
-
-
-@pytest.fixture
-def ffmpeg_settings():
-    import os
-    ffmpeg = os.environ.get("VIDEOLENS_TEST_FFMPEG") or shutil.which("ffmpeg")
-    ffprobe = os.environ.get("VIDEOLENS_TEST_FFPROBE") or shutil.which("ffprobe")
-    if not ffmpeg or not ffprobe:
-        pytest.skip("真实 FFmpeg/FFprobe 未安装，不能把模拟测试当作媒体实测。")
-    return settings(ffmpeg=ffmpeg, ffprobe=ffprobe)
-
-
-def test_real_media_chinese_path_scene_frames_and_audio(tmp_path, ffmpeg_settings):
-    cfg = ffmpeg_settings
-    video = tmp_path / "中文 & 测试视频.mp4"
-    subprocess.run([cfg.ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "color=red:s=640x360:r=10:d=2",
-                    "-f", "lavfi", "-i", "color=blue:s=640x360:r=10:d=2", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=4",
-                    "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]", "-map", "[v]", "-map", "2:a", "-c:v", "mpeg4", "-c:a", "aac", str(video)], check=True, capture_output=True)
-    info = probe(video, cfg)
-    assert info["duration_ms"] == 4000 and info["has_audio"]
-    assert info["width"] == 640 and info["height"] == 360
-    audio = extract_audio(video, tmp_path / "音轨.wav", cfg)
-    import wave
-    with wave.open(str(audio)) as wav:
-        assert wav.getnchannels() == 1 and wav.getframerate() == 16000
-    clips = make_clips([], info["duration_ms"], cfg)
-    frames = extract_frames(video, clips, tmp_path / "关键帧", cfg)
-    assert len(frames) == 2  # 红蓝两种画面，静态重复帧被去重。
-    assert all(frame["timestamp_verified"] and frame["width"] == 640 and frame["size_bytes"] < 200000 for frame in frames)
-    assert all(0 <= frame["timestamp_ms"] < 4000 for frame in frames)
-    assert any(abs(frame["timestamp_ms"] - 2000) < 110 for frame in frames)
-
-
-def test_external_chinese_subtitle_preferred(tmp_path):
-    video = tmp_path / "source.mp4"
-    video.touch()
-    (tmp_path / "source.en.srt").write_text("1\n00:00:00,000 --> 00:00:02,000\nEnglish\n", encoding="utf-8")
-    (tmp_path / "source.zh-Hans.srt").write_text("1\n00:00:00,000 --> 00:00:02,000\n中文\n", encoding="utf-8")
-    assert find_subtitles(video, tmp_path / "工作", settings())[0]["text"] == "中文"
-
-
-def test_real_embedded_chinese_and_english_subtitles_without_audio(tmp_path, ffmpeg_settings):
-    cfg = ffmpeg_settings
-    english, chinese = tmp_path / "英语.srt", tmp_path / "中文.srt"
-    english.write_text("1\n00:00:00,000 --> 00:00:01,500\nEnglish subtitle\n", encoding="utf-8")
-    chinese.write_text("1\n00:00:00,000 --> 00:00:01,500\n中文内嵌字幕\n", encoding="utf-8")
-    video = tmp_path / "多语言.mkv"
-    subprocess.run([cfg.ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "color=green:s=320x180:r=10:d=2",
-                    "-i", str(english), "-i", str(chinese), "-map", "0:v", "-map", "1:0", "-map", "2:0",
-                    "-c:v", "mpeg4", "-c:s", "srt", "-metadata:s:s:0", "language=eng", "-metadata:s:s:1", "language=zho",
-                    "-t", "2", str(video)], check=True, capture_output=True)
-    metadata = probe(video, cfg)
-    assert not metadata["has_audio"]
-    assert {row["language"] for row in metadata["subtitle_streams"]} == {"eng", "zho"}
-    assert find_subtitles(video, tmp_path / "工作", cfg)[0]["text"] == "中文内嵌字幕"
-    cfg.subtitle_language = "en"
-    assert find_subtitles(video, tmp_path / "工作", cfg)[0]["text"] == "English subtitle"
-
-
-def test_real_corrupt_video_is_rejected(tmp_path, ffmpeg_settings):
-    path = tmp_path / "损坏的视频.mp4"
-    path.write_bytes(b"This is not a valid media container.")
-    with pytest.raises(MediaError):
-        probe(path, ffmpeg_settings)
-
-
-@pytest.fixture
-def local_http_video(tmp_path, ffmpeg_settings):
-    """真实 HTTP + 真实 yt-dlp；slow 路径故意限速，便于验证下载中途取消。"""
-    pytest.importorskip("yt_dlp", reason="需要实际下载器才能验证下载行为")
-    cfg = ffmpeg_settings
-    source = tmp_path / "http-source.mp4"
-    subprocess.run([cfg.ffmpeg, "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24:duration=3",
-                    "-an", "-c:v", "mpeg4", "-q:v", "2", str(source)], check=True, capture_output=True)
-    payload = source.read_bytes()
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-
-        def do_HEAD(self):
-            self.send_response(200)
-            self.send_header("Content-Type", "video/mp4")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-
-        def do_GET(self):
-            self.do_HEAD()
-            try:
-                for start in range(0, len(payload), 1024):
-                    self.wfile.write(payload[start:start + 1024])
-                    self.wfile.flush()
-                    if self.path.startswith("/slow"):
-                        time.sleep(0.03)
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                pass
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    yield f"http://127.0.0.1:{server.server_port}", source, cfg
-    server.shutdown()
-    server.server_close()
-
-
-def test_real_ytdlp_http_download_is_byte_exact_and_probeable(tmp_path, local_http_video):
-    base_url, source, cfg = local_http_video
-    result = download(base_url + "/fixture.mp4", tmp_path / "下载结果", cfg)
-    assert hashlib.sha256(result.read_bytes()).digest() == hashlib.sha256(source.read_bytes()).digest()
-    metadata = probe(result, cfg)
-    assert metadata["duration_ms"] == 3000 and metadata["width"] == 640
-    assert not metadata["has_audio"] and not metadata["subtitle_streams"]
-    assert find_subtitles(result, tmp_path / "工作", cfg) == []
-
-
-def test_real_ytdlp_cancel_stops_active_partial_download(tmp_path, local_http_video):
-    import psutil
-    base_url, _, cfg = local_http_video
-    target = tmp_path / "取消下载"
-    started = time.monotonic()
-    cancelled_at, children = [], []
-
-    class Cancelled(Exception):
-        pass
-
-    def check():
-        # 只有已经产生真实 .part 内容才取消，避免只测到下载器尚未启动的情况。
-        if any(path.stat().st_size > 0 for path in target.glob("*.part")):
-            cancelled_at.append(time.monotonic())
-            children.extend(psutil.Process().children(recursive=True))
-            raise Cancelled()
-        if time.monotonic() - started > 20:
-            raise TimeoutError("下载未按预期生成可取消的部分文件")
-
-    with pytest.raises(Cancelled):
-        download(base_url + "/slow.mp4", target, cfg, check)
-    assert cancelled_at and time.monotonic() - cancelled_at[0] < 4
-    assert any(path.stat().st_size > 0 for path in target.glob("*.part"))
-    assert not any(child.is_running() for child in children)
+print(f"\n通过 {len(ok)} / {len(ok) + len(fail)}")
+if fail:
+    print("失败项:")
+    for item in fail:
+        print("  - " + item)
+sys.exit(0 if not fail else 1)

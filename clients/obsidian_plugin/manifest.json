@@ -1,0 +1,10 @@
+{
+  "id": "zhiying-video",
+  "name": "知影 · 视频智能分析",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "连接本地知影服务：分析视频、把带毫秒时间戳的引用问答写进笔记。数据不出本机。",
+  "author": "知影 (ZhiYing)",
+  "authorUrl": "https://github.com/",
+  "isDesktopOnly": true
+}

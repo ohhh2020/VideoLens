@@ -1,0 +1,376 @@
+# =============================================================================
+# 知影 (ZhiYing) —— 全局应用配置
+#
+# 覆盖优先级（高 → 低）：
+#   1. 环境变量        ZH_YING__<SECTION>__<KEY>
+#   2. data/user_settings.json（网页设置页写的那一层，见 core/user_settings.py）
+#   3. 本文件
+#   4. 代码内 dataclass 默认值
+#
+# 环境变量写法（双下划线表示层级，值为字符串按目标字段类型自动转换）：
+#   ZH_YING__CHUNK__MIN_MS=12000
+#   ZH_YING__RETRIEVAL__WEIGHTS__TEXT=1.0
+#   ZH_YING__PATHS__DATA=D:/zhiying-data
+#   ZH_YING__LOGGING__LEVEL=DEBUG
+#
+# 敏感信息（API Key / Token）只放 .env 或系统环境变量，本文件内一律留空。
+# 未在本文件中声明的配置项视为拼写错误，加载时直接报错。
+# =============================================================================
+
+app:
+  name: zhiying
+  version: 0.1.0
+  # 项目根目录，"." 表示自动探测（向上查找含 configs/app_config.yaml 的目录）
+  root: "."
+
+# -----------------------------------------------------------------------------
+# 路径：所有运行时数据集中在 data/ 下，与代码目录分离，便于 .gitignore 与清理
+# 相对路径按 app.root 解析；绝对路径原样使用
+# -----------------------------------------------------------------------------
+paths:
+  data: "data"
+  models: "models"                 # 仅作 fallback，权威值见 models.yaml 的 cache.root
+  videos: "data/videos"            # 下载/导入的原始视频
+  audio: "data/audio"              # 抽取出的 16kHz 单声道 wav
+  frames: "data/frames"            # 关键帧 JPG
+  temp: "data/temp"                # 临时文件，进程退出即清理
+  sqlite: "data/zhiying.db"        # 元数据与切片关系
+  chroma: "data/chroma"            # ChromaDB 持久化目录
+  logs: "logs"
+  exports: "data/exports"          # 报告 Markdown / JSON 导出
+
+# -----------------------------------------------------------------------------
+# 模型配置
+# -----------------------------------------------------------------------------
+models:
+  # 权重清单文件（含 ModelScope / HuggingFace 双源、量化、allow_patterns 白名单）
+  config_file: "configs/models.yaml"
+  # 首选设备：auto 表示探测 CUDA，不可用则降级 CPU
+  device: "auto"
+  # 允许 CPU 降级
+  allow_cpu_fallback: true
+  # 同时驻留显存的模型数上限，超出后按 LRU 释放
+  max_loaded_models: 2
+  # 推理时允许就地下载缺失权重。默认 false：缺权重就降级，下载统一走
+  #   python scripts/download_models.py
+  # 打开它只会让"点一下分析"顺便拉几个 GB，答辩现场很容易翻车。
+  auto_download: false
+
+# -----------------------------------------------------------------------------
+# 媒体处理
+# -----------------------------------------------------------------------------
+media:
+  # 统一转成 16kHz 单声道 PCM，供 faster-whisper 使用
+  audio_sample_rate: 16000
+  audio_channels: 1
+  audio_codec: "pcm_s16le"
+  audio_format: "wav"
+  # 单个 ffmpeg 进程超时（毫秒）
+  ffmpeg_timeout_ms: 1_800_000
+  ffprobe_timeout_ms: 30_000
+  # 下载（yt-dlp）
+  download:
+    max_retries: 3
+    backoff_base: 2.0
+    backoff_max: 60.0
+    socket_timeout_s: 30.0
+    retries_per_fragment: 10
+    concurrent_fragments: 4
+    resume: true
+    cookies_from_browser: null     # "chrome" / "edge" / null
+    # 云端视频元数据最大字符数（需求文档约束）
+    max_url_length: 2048
+
+  scene_detect:
+    # content / adaptive / hash / ffmpeg / fixed
+    detector: "content"
+    threshold: 27.0
+    min_scene_len_ms: 1_200
+    frame_skip: 0
+    # 每个场景候选抽帧数上限（内部会按清晰度择优保留 frames_per_scene 张）
+    candidate_cap: 6
+    frames_per_scene: 2
+    min_frames_per_scene: 1
+    # 拉普拉斯方差阈值，低于此值判定为模糊
+    blur_threshold: 60.0
+    # 模糊时是否直接丢弃（false 则保留并标记 quality_ok=False）
+    drop_blurry: false
+    # 同一场景内按清晰度挑帧时跳过"长得一样"的候选。
+    # 判据：64×64 灰度按 4×4 分块取最差块的平均灰度差 < dedupe_max_diff，
+    # 且平均色距离 < dedupe_color_distance（两个条件同时满足才算重复）。
+    dedupe_frames: true
+    dedupe_max_diff: 1.5
+    dedupe_color_distance: 30.0
+    dedupe_probe_side: 64
+    dedupe_grid: 4
+    keyframe:
+      min_short_side: 720          # 短边不低于 720p，源更小则不放大只告警
+      max_jpeg_bytes: 204800       # 200KB 硬上限
+      jpeg_quality_min: 55
+      jpeg_quality_max: 92
+      jpeg_subsampling: 2          # 4:2:0，压缩率最优
+      format: "jpg"
+    max_workers: 4
+    # 保留 ffmpeg 抽帧探针目录（调试用，生产关闭）
+    keep_probe_dir: false
+
+# -----------------------------------------------------------------------------
+# 语音转写（faster-whisper）
+# -----------------------------------------------------------------------------
+asr:
+  # 默认 large-v3-turbo：large-v3 的解码器 32 层，turbo 只有 4 层，CPU 上快 6~8 倍。
+  # 有 GPU（显存 >=8G）可改回 "faster-whisper-large-v3" 换一点 CER。
+  model: "faster-whisper-large-v3-turbo"
+  # null 表示自动跟随 models.device；可强制 "cuda" / "cpu"
+  device: null
+  # int8 / int8_float16 / float16 / float32；null = 按设备自动选择
+  compute_type: null
+  beam_size: 5
+  language: null                   # null = 自动检测
+  vad_filter: true
+  vad_min_silence_ms: 500
+  # 字幕优先：命中以下扩展名则跳过 ASR，直接解析
+  subtitle_priority: ["srt", "vtt", "ass", "ssa"]
+  # 无字幕时才转写；转写失败降级顺序见下
+  fallback_to_subtitle: true
+  # 语种置信度低于该值时告警
+  min_language_probability: 0.5
+
+# -----------------------------------------------------------------------------
+# 视觉理解（Qwen2-VL）
+# -----------------------------------------------------------------------------
+vl:
+  model: "qwen2-vl-2b-gguf"
+  max_new_tokens: 512
+  temperature: 0.1
+  # 单张图送入模型前的最长边（像素），过大拖慢推理
+  max_image_side: 448
+  # 描述提示词模板名（见 configs/prompts.yaml）
+  prompt_key: "keyframe_describe"
+  # 失败重试次数，用尽后降级为纯文本总结
+  max_retries: 2
+  batch_size: 1
+  # 多帧一次推理的帧数上限。实测 2 帧最优（模型会自己写出"起初…随后…"）；
+  # 4 帧起 2B 模型为了找差异会编造画面里没有的内容，别调高。
+  sequence_frames: 2
+  sequence_temperature: 0.1
+  # true = 按场景分组做连续理解（一段时间窗一次推理，产出叙述）
+  # false = 退回逐帧独立描述（旧行为，每帧互不知情）
+  sequence_mode: true
+
+# -----------------------------------------------------------------------------
+# 向量化与检索
+# -----------------------------------------------------------------------------
+embedding:
+  text_model: "bge-m3"
+  image_model: "siglip2-base"
+  # BGE-M3 稠密向量维度（用于写入前校验，防止换模型后维度错配）
+  text_dim: 1024
+  image_dim: 768
+  batch_size: 16
+  # L2 归一化，配合 Chroma 的 cosine 空间
+  normalize: true
+  max_text_chars: 8192
+
+retrieval:
+  # 向量库后端：chroma（HNSW 索引，需 chromadb）或 sqlite（零依赖，线性扫描）
+  backend: "chroma"
+  # 最终返回条数
+  top_k: 6
+  # 每个通道的过采样倍数（召回 top_k * fetch_multiplier 条再融合）
+  fetch_multiplier: 4
+  # RRF 平滑常数，论文默认 60
+  rrf_k: 60
+  # 通道权重
+  weights:
+    text: 1.0
+    image: 0.8
+    bm25: 0.6
+  # 归一化后的最低得分，低于此值丢弃
+  min_score: 0.05
+  # 单通道超时（毫秒），超时该通道降级为空结果但不影响其它通道
+  channel_timeout_ms: 3000
+  # Chunk 内文本最大字符数（超长截断并标 truncated）
+  max_clip_chars: 1000
+  # 是否把图像通道命中的关键帧路径一并注入上下文
+  include_keyframes: true
+  # BM25 参数
+  bm25:
+    k1: 1.5
+    b: 0.75
+    # jieba / char / naive
+    tokenizer: "jieba"
+    # 中文检索时忽略的停用词（少量高频词即可，全表会拖慢建索引）
+    stopwords: ["的", "了", "是", "在", "和", "也", "就", "都", "而", "及", "与"]
+
+# -----------------------------------------------------------------------------
+# 切片（10~30s 自适应合并）
+# -----------------------------------------------------------------------------
+chunk:
+  min_ms: 10_000
+  max_ms: 30_000
+  target_ms: 20_000
+  # 边界外扩重叠量（两侧各一半）
+  overlap_ms: 1_500
+  # 静音点判定阈值：相邻 segment 间隔超过此值即可作为切分点
+  silence_ms: 600
+  # 注：句末/分句标点表与边界权重（sentence_end/clause_end/weight_sentence/
+  # weight_clause/weight_silence/weight_target）由 chunker 内部常量控制，
+  # 曾在此暴露但从未接线，已移除以免"改了不生效"。要调请改
+  # core/rag/chunker.py 的 _BOUNDARY_WEIGHTS / _SOFT_BREAKS。
+  #
+  # 非法短尾惩罚系数
+  weight_tail_penalty: 0.6
+  # 超长无标点语音的硬切长度（超过则强制切分）
+  hard_split_ms: 30_000
+  # 输出文本最大字符数（超长截断，text 额外保留重叠区）
+  max_chars: 1000
+
+# -----------------------------------------------------------------------------
+# LLM 网关（OpenAI 兼容 / llama.cpp 本地）
+# -----------------------------------------------------------------------------
+llm:
+  # cloud / local / auto；auto = 云端可用则云端，超时/失败降级本地
+  mode: "auto"
+  cloud:
+    base_url: "https://api.openai.com/v1"
+    model: "gpt-4o-mini"
+    api_key_env: "OPENAI_API_KEY"   # 只存环境变量名，绝不写真实 key
+    timeout_s: 60
+    max_retries: 2
+    temperature: 0.3
+    max_tokens: 2048
+  local:
+    model: "qwen2.5-7b-gguf"
+    n_ctx: 8192
+    n_threads: null                 # null = 物理核数
+    n_gpu_layers: -1                # -1 = 全部卸载到 GPU（无 GPU 时自动 0）
+    temperature: 0.3
+    max_tokens: 2048
+  # 全部失败后的兜底：jieba 关键词抽取
+  fallback_keywords: true
+  fallback_top_keywords: 20
+
+# -----------------------------------------------------------------------------
+# 持久化
+# -----------------------------------------------------------------------------
+storage:
+  sqlite:
+    # WAL 模式，允许读写并发
+    journal_mode: "WAL"
+    busy_timeout_ms: 5_000
+    # 连接池大小（FastAPI 并发请求共享）
+    pool_size: 4
+  chroma:
+    # 集合名（Chroma 要求 3~512 字符，仅 [a-zA-Z0-9._-]，首尾为字母数字）
+    clip_collection: "clip_text"
+    frame_collection: "frame_image"
+    # cosine / l2 / ip
+    metric: "cosine"
+    # 是否在启动时校验集合维度与 embedding.text_dim 一致
+    verify_dim: true
+  # 容量上限（需求文档表 3）
+  limits:
+    max_videos: 200
+    max_clips: 50_000
+    max_transcript_segments: 500_000
+    max_keyframes: 100_000
+    max_keyframe_bytes: 21_474_836_480     # 20 GiB
+    max_text_vectors: 50_000
+    max_image_vectors: 100_000
+    max_result_bytes: 5_368_709_120        # 5 GiB
+    # 分析产物（报告/导出）登记行数上限；tasks 簿记表不设硬闸、按条数裁剪
+    max_artifacts: 5_000
+  # 生命周期清理（由 scripts/gc.py 执行，服务进程自身不做定时删除）
+  retention:
+    # 0 = 永不删除
+    temp_hours: 24
+    orphan_frames_days: 30
+    # 分析完成后保留多少天（0 = 永不按时间删）
+    video_ttl_days: 0
+    # 超过容量上限时从最久完成的分析开始回收
+    auto_prune: true
+
+# -----------------------------------------------------------------------------
+# 服务接口
+# -----------------------------------------------------------------------------
+api:
+  host: "127.0.0.1"
+  port: 8000
+  # 单次请求体上限（视频走 multipart 上传时放宽）
+  max_body_bytes: 4_294_967_296
+  # SSE 心跳间隔（秒），防止代理断连
+  sse_heartbeat_s: 15
+  # 简单访问控制：非空时要求 Authorization: Bearer <token>
+  auth_token_env: "ZHIYING_API_TOKEN"
+  cors_origins: ["http://127.0.0.1:7860", "http://localhost:7860"]
+  # 单条 HTTP 请求超时
+  request_timeout_s: 300
+  # 把 Web 界面挂到本服务的 /ui，打开 http://127.0.0.1:8000 直接是界面。
+  # 关掉后根路径只给一行提示，界面要另起 clients/gradio_ui.py（7860 端口）。
+  serve_ui: true
+
+mcp:
+  # stdio / http（SSE 传输未实现，不再接受该值）
+  transport: "stdio"
+  server_name: "zhiying"
+  server_version: "0.1.0"
+  # MCP 单次调用超时（需求文档：≤30s）
+  call_timeout_s: 30
+
+gradio:
+  host: "127.0.0.1"
+  port: 7860
+  share: false
+  theme: "soft"
+  # 卡片式布局的每页条数
+  page_size: 20
+
+# -----------------------------------------------------------------------------
+# 输入输出硬约束（需求文档表 2）
+# -----------------------------------------------------------------------------
+limits:
+  max_url_length: 2048
+  max_duration_ms: 7_200_000        # 2 小时
+  max_file_bytes: 4_294_967_296     # 4 GiB
+  max_question_chars: 500
+  max_report_chars: 5_000
+  min_keyframe_short_side: 720
+  # 时间戳对齐误差上限（毫秒）
+  timestamp_tolerance_ms: 1_000
+  keyframe_tolerance_ms: 100
+  citation_tolerance_ms: 2_000
+  # 重模型串行：同一时刻只让一个 ASR / 视觉 / 向量 / 本地 LLM 占内存。
+  # 两路任务并行 = 两套权重同时驻留，8G 机器会换页假死，比串行更慢。
+  inference_serial: true
+
+# -----------------------------------------------------------------------------
+# 性能目标（写入 metrics，用于自检告警，不参与业务逻辑）
+# -----------------------------------------------------------------------------
+targets:
+  parse_1h_cpu_ms: 1_800_000        # 30 min
+  parse_1h_gpu_ms: 600_000          # 10 min
+  asr_1h_cpu_ms: 2_400_000          # 40 min
+  asr_1h_gpu_ms: 600_000            # 10 min
+  qa_first_response_ms: 10_000
+  qa_first_token_ms: 3_000
+  mcp_call_ms: 30_000
+  ui_response_ms: 200
+  # 质量指标
+  zh_cer_max: 0.15
+  en_wer_max: 0.20
+
+# -----------------------------------------------------------------------------
+# 日志
+# -----------------------------------------------------------------------------
+logging:
+  level: "INFO"
+  format: "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"
+  file: "logs/zhiying.log"
+  max_bytes: 10_485_760
+  backup_count: 5
+  # 脱敏：日志中出现以下字段名的值一律替换为 ***
+  redact_keys: ["api_key", "token", "password", "secret", "authorization", "cookie"]
+  # 本地模式下禁止记录用户视频路径与转录正文
+  local_mode_strict: true
