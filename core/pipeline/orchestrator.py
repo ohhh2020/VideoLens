@@ -600,6 +600,18 @@ class Orchestrator:
                     StageReport(stage=Stage.DONE, skipped=True, message="已完成，未重跑")
                 )
                 self._end(report, Stage.DONE, progress)
+                # 老视频（v5 之前分析的）没有落库报告：趁机重建总结并补存，
+                # 让「已分析完成，跳过」路径也能在 /ui 视频库看到完整报告。
+                try:
+                    if self._repo.get_video_report(video_id) is None:
+                        if not opts.skip_summary:
+                            report.summary, report.summary_backend = self._summarize(
+                                video_id, report.title or existing.title,
+                                report.duration_ms or existing.duration_ms, opts,
+                            )
+                        self._repo.set_video_report(video_id, report.to_dict())
+                except Exception:  # noqa: BLE001 - 补存失败不影响"已完成"
+                    logger.warning("旧视频报告补存失败 video_id=%s", video_id, exc_info=True)
                 return report
             # 断点必须在 _register_video **之前**读：注册会 upsert 视频行，
             # 把上一轮失败的 stage 覆写成空，恢复点就永远读不到了。
@@ -758,6 +770,11 @@ class Orchestrator:
                                        message="分析完成")
             report.status = "ready"
             self._end(report, Stage.DONE, progress)
+            # 报告落库：重启后 /ui 视频库「报告」入口仍能看到这次的结果
+            try:
+                self._repo.set_video_report(video_id, report.to_dict())
+            except Exception:  # noqa: BLE001 - 报告持久化失败不影响分析结论
+                logger.warning("分析报告落库失败 video_id=%s", video_id, exc_info=True)
 
         except Exception as exc:  # noqa: BLE001 - 顶层兜底
             message = f"{type(exc).__name__}: {exc}"

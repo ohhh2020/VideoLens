@@ -294,7 +294,8 @@ async function sendQuestion(){
         const line=buf.slice(0,i).trim(); buf=buf.slice(i+2);
         if(!line.startsWith("data:"))continue;
         const evt=JSON.parse(line.slice(5));
-        if(evt.type==="delta"){acc+=evt.data;msg.textContent=acc;flow.scrollTop=flow.scrollHeight}
+        if(evt.type==="meta"){meta.textContent="已检索 "+(evt.candidates??evt.data?.candidates??"")+" 条证据，生成中…"}
+        else if(evt.type==="delta"){acc+=evt.data;msg.textContent=acc;flow.scrollTop=flow.scrollHeight}
         else if(evt.type==="final"){
           const R=evt.result; refs=R.refs||[]; notes=R.notes||[];
           msg.innerHTML=renderAnswer(R.answer,refs);
@@ -342,7 +343,15 @@ function toast2(msg){const t=document.createElement("div");
   t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),2200)}
 player.addEventListener("timeupdate",()=>{$("#clock").textContent=
   hms(player.currentTime*1000).slice(0,8)+" / "+hms((player.duration||0)*1000).slice(0,8)});
-loadVideos();
+async function init(){
+  await loadVideos();
+  // 支持 /chat?video_id=xxx 直接定位（/ui「去对话页追问」入口）
+  const want=(new URLSearchParams(location.search)).get("video_id");
+  if(!want)return;
+  const target=[...document.querySelectorAll(".vitem")].find(e=>e.dataset.id===want);
+  if(target)target.click();
+}
+init();
 </script>
 </body>
 </html>

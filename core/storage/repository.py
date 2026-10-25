@@ -128,7 +128,7 @@ VideoStatus = Literal[
 
 TaskStatus = Literal["pending", "running", "done", "failed", "cancelled"]
 
-SCHEMA_VERSION: Final[int] = 4
+SCHEMA_VERSION: Final[int] = 5
 
 #: 表名 → ``storage.limits`` 里对应的上限字段
 _LIMIT_MAP: Final[dict[str, str]] = {
@@ -603,8 +603,13 @@ _DDL_V4: Final[tuple[str, ...]] = (
     "CREATE INDEX IF NOT EXISTS idx_qa_session ON qa_history(session_id)",
 )
 
+# ===== v5：分析报告持久化（重启后 /ui 仍能查看上次分析结果）=====
+_DDL_V5: Final[tuple[str, ...]] = (
+    "ALTER TABLE videos ADD COLUMN report_json TEXT NOT NULL DEFAULT ''",
+)
+
 _MIGRATIONS: Final[dict[int, tuple[str, ...]]] = {
-    1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3, 4: _DDL_V4,
+    1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3, 4: _DDL_V4, 5: _DDL_V5,
 }
 
 # =============================================================================
@@ -1247,6 +1252,39 @@ class SqliteRepository:
             "SELECT * FROM transcript_segments WHERE video_id=? ORDER BY index_no", (video_id,)
         )
         return [_row_to_segment(r) for r in rows]
+
+    # -- 分析报告持久化（v5） ----------------------------------------------- #
+
+    def set_video_report(self, video_id: str, report: Mapping[str, Any]) -> None:
+        """把一次成功分析的完整报告（``AnalysisReport.to_dict()``）存进视频行。
+
+        存 JSON 文本而非拆列：报告结构跟着产品演进，读的时候原样吐回，
+        老报告遇到新代码多一个少一个字段都不致命。
+        """
+        payload = json.dumps(dict(report), ensure_ascii=False)
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE videos SET report_json=? WHERE video_id=?", (payload, video_id)
+            )
+            if cur.rowcount == 0:
+                raise NotFoundError("video", video_id)
+
+    def get_video_report(self, video_id: str) -> dict[str, Any] | None:
+        """取上次分析落库的报告；从未分析成功过则返回 ``None``。"""
+        rows = self._query(
+            "SELECT report_json FROM videos WHERE video_id=?", (video_id,)
+        )
+        if not rows:
+            raise NotFoundError("video", video_id)
+        raw = str(rows[0]["report_json"] or "")
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("视频 %s 的持久化报告损坏，忽略", video_id)
+            return None
+        return data if isinstance(data, dict) else None
 
     # -- keyframes ---------------------------------------------------------
 

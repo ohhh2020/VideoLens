@@ -176,6 +176,7 @@ def main() -> int:
         overrides={
             "paths.audio": str(WORK / "audio"),
             "paths.frames": str(WORK / "frames"),
+            "paths.videos": str(WORK / "videos"),
             "paths.sqlite": str(WORK / "zhiying.db"),
             "paths.chroma": str(WORK / "chroma"),
             "api.sse_heartbeat_s": 1,
@@ -280,6 +281,54 @@ def main() -> int:
           r.headers.get("content-type"))
     check("图片有字节", len(r.content) > 1024, len(r.content))
     check("图片 <= 200KB", len(r.content) <= 200 * 1024, len(r.content))
+
+    print("\n=== 5b. 字幕导出（SRT/VTT） ===")
+    r = client.get(f"/api/videos/{video_id}/subtitles")
+    check("SRT 200", r.status_code == 200, f"{r.status_code} {r.text[:200]}")
+    check("SRT 是附件", "attachment" in r.headers.get("content-disposition", ""),
+          r.headers.get("content-disposition"))
+    check("SRT 文件名带 .srt", ".srt" in r.headers.get("content-disposition", ""),
+          r.headers.get("content-disposition"))
+    srt = r.text
+    check("SRT 含 4 个块", srt.count("\n\n") == 3 and srt.strip().startswith("1\n"), srt[:120])
+    check("SRT 时间戳用逗号", "00:00:00,000 --> 00:00:08,200" in srt, srt[:80])
+    check("SRT 含转写文本", "切片长度默认十到三十秒" in srt, "")
+
+    r = client.get(f"/api/videos/{video_id}/subtitles?format=vtt")
+    check("VTT 200", r.status_code == 200, r.status_code)
+    vtt = r.text
+    check("VTT 有 WEBVTT 头", vtt.startswith("WEBVTT\n"), vtt[:20])
+    check("VTT 时间戳用点号", "00:00:00.000 --> 00:00:08.200" in vtt, vtt[:80])
+    check("VTT 无逗号时间戳", ",0" not in vtt.split("\n")[2] if len(vtt.split("\n")) > 2 else True, "")
+
+    r = client.get(f"/api/videos/{video_id}/transcript")
+    check("transcript 200", r.status_code == 200, r.status_code)
+    tr = r.json()
+    check("transcript 4 段", tr["count"] == 4, tr.get("count"))
+    check("transcript 含时间戳", tr["segments"][0]["start_ms"] == 0, tr["segments"][:1])
+    check("transcript 含文本", "切片长度" in tr["segments"][1]["text"], "")
+
+    r = client.get(f"/api/videos/{video_id}/subtitles?format=bogus")
+    check("非法 format 422", r.status_code == 422, r.status_code)
+
+    r = client.get("/api/videos/not-exist/subtitles")
+    check("404 视频不存在", r.status_code == 404, r.status_code)
+
+    # 空段视频：手动建一个无转写片段的视频记录
+    parts["repo"].add_video(video_id="v-empty", title="无转写", status="ready")
+    r = client.get("/api/videos/v-empty/subtitles")
+    check("无转写片段 404", r.status_code == 404, r.status_code)
+
+    r = client.get(f"/api/videos/{video_id}/report")
+    check("持久化报告 200", r.status_code == 200, f"{r.status_code} {r.text[:120]}")
+    rep = r.json()
+    check("报告状态 ready", rep.get("status") == "ready", rep.get("status"))
+    check("报告带总结", bool((rep.get("summary") or "").strip()), str(rep.get("summary"))[:60])
+    check("报告带阶段", len(rep.get("stages") or []) == 9, len(rep.get("stages") or []))
+    r = client.get("/api/videos/not-exist/report")
+    check("报告 404 视频不存在", r.status_code == 404, r.status_code)
+    r = client.get("/api/videos/v-empty/report")
+    check("报告 404 未分析", r.status_code == 404, r.status_code)
 
     print("\n=== 6. 问答 ===")
     r = client.post(f"/api/videos/{video_id}/ask", json={"question": "切片长度是怎么定的"})
@@ -507,10 +556,18 @@ def main() -> int:
     check("stats 视频数 >= 1", stats["videos"] >= 1, stats["videos"])
     check("stats 有 usage 占比", isinstance(stats["usage"], dict), stats["usage"])
 
+    # 项目内视频副本应随删除一起清掉（下载到 data/videos 的 source.mp4）
+    src_copy = WORK / "videos" / video_id / "source.mp4"
+    src_copy.parent.mkdir(parents=True, exist_ok=True)
+    src_copy.write_bytes(b"\x00" * 128)
+    # 把副本登记为该视频的 local_path —— 模拟"下载入库"后的真实记录
+    parts["repo"].add_video(video_id=video_id, local_path=str(src_copy), replace=True)
     r = client.delete(f"/api/videos/{video_id}")
     check("delete 200", r.status_code == 200, f"{r.status_code} {r.text[:200]}")
     check("delete 报告向量清理", isinstance(r.json().get("vectors"), dict), r.json())
+    check("项目内视频副本已删", not src_copy.exists(), str(src_copy))
     check("删除后 404", client.get(f"/api/videos/{video_id}").status_code == 404)
+    check("删除后报告也没了", client.get(f"/api/videos/{video_id}/report").status_code == 404)
 
     print("\n=== 12. 降级启动 ===")
     app2 = __import__("api.main", fromlist=["create_app"]).create_app(cfg, load_models=False, serve_ui=False)

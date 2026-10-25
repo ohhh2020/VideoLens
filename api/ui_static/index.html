@@ -134,8 +134,19 @@ h2.sect{font-size:15px;margin:0 0 12px}
     <div class="card" id="resultCard" style="display:none">
       <h3 id="resultTitle">分析结果</h3>
       <div id="resultBody" style="font-size:13px"></div>
-      <div style="margin-top:10px">
+      <div id="transcriptBox" style="display:none;margin-top:10px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <b style="font-size:13px">📝 语音转写结果</b>
+          <span class="savehint" id="transcriptMeta"></span>
+        </div>
+        <div id="transcriptBody" style="max-height:420px;overflow-y:auto;margin-top:8px;
+             background:var(--panel2);border:1px solid var(--border);border-radius:10px;
+             padding:10px 14px;font-size:12.5px;line-height:1.7"></div>
+      </div>
+      <div style="margin-top:10px;display:flex;gap:14px;align-items:center">
         <a class="tlink" id="goChat" href="#">💬 去对话页追问 →</a>
+        <a class="tlink" id="exportMd" href="#" style="color:var(--ok)">📄 一键导出报告 MD</a>
+        <a class="tlink" id="toggleTranscript" href="#">📝 转写结果</a>
       </div>
     </div>
   </section>
@@ -242,18 +253,74 @@ $("#go").onclick=async()=>{
     $("#go").disabled=false;$("#progText").textContent="提交失败："+e.message;toast("提交失败")
   }
 };
+let lastReport=null;
 function showResult(t){
   const rep=t.report||{};
+  lastReport=rep;
   $("#resultCard").style.display="block";
+  $("#transcriptBox").style.display="none";
   $("#resultTitle").textContent=t.status==="done"?"✅ 分析完成":"❌ 分析未完成";
   if(t.status==="failed"){$("#resultBody").innerHTML='<span style="color:var(--bad)">'+esc(t.error||"未知错误")+"</span>";return}
   const rows=[["video_id",rep.video_id],["标题",rep.title],["时长",hms(rep.duration_ms)],
     ["切片",rep.clip_count],["关键帧",rep.keyframe_count],["向量",rep.vector_count],
     ["转录来源",rep.transcript_source||"-"],["语言",rep.language||"-"]];
   $("#resultBody").innerHTML=rows.map(([k,v])=>`<div><b>${k}</b>  ${esc(String(v??"-"))}</div>`).join("")
-    +(rep.summary?`<div style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px">${esc(rep.summary.slice(0,600))}</div>`:"");
+    +(rep.summary?`<div style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px;
+       max-height:420px;overflow-y:auto;white-space:pre-wrap;line-height:1.7">${esc(rep.summary)}</div>`:"");
   if(rep.video_id)$("#goChat").href="/chat?video_id="+rep.video_id;
 }
+$("#exportMd").onclick=async e=>{
+  e.preventDefault();
+  const rep=lastReport;if(!rep||!rep.video_id)return;
+  let transcriptText="";
+  try{
+    const r=await fetch(`/api/videos/${rep.video_id}/transcript`,{headers:H()});
+    if(r.ok){
+      const d=await r.json();
+      transcriptText=(d.segments||[]).map(s=>`[${hms(s.start_ms)}] ${s.text}`).join("\n");
+    }
+  }catch(err){/* 转写拉取失败不阻断导出 */}
+  const md=["# "+(rep.title||rep.video_id),
+    "",
+    `- 时长：${hms(rep.duration_ms)}`,
+    `- 语言：${rep.language||"-"} · 转录来源：${rep.transcript_source||"-"}`,
+    `- 切片 ${rep.clip_count||0} 个 · 关键帧 ${rep.keyframe_count||0} 个 · 向量 ${rep.vector_count||0} 条`,
+    "",
+    "## 综合总结","",
+    (rep.summary||"（无）").trim(),"",
+    "## 语音转写全文","",
+    transcriptText||"（无转写内容）"
+  ].join("\n");
+  const blob=new Blob([md],{type:"text/markdown;charset=utf-8"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url;a.download=(rep.title||rep.video_id).replace(/[\\/:*?"<>|]/g,"")+".md";a.click();
+  URL.revokeObjectURL(url);toast("已导出 Markdown");
+};
+$("#toggleTranscript").onclick=async e=>{
+  e.preventDefault();
+  const rep=lastReport;if(!rep||!rep.video_id)return;
+  const box=$("#transcriptBox");
+  if(box.style.display==="none"){
+    if(!$("#transcriptBody").innerText.trim()){
+      $("#transcriptBody").textContent="加载中…";
+      try{
+        const r=await fetch(`/api/videos/${rep.video_id}/transcript`,{headers:H()});
+        if(!r.ok){$("#transcriptBody").textContent="转写结果加载失败（"+r.status+"）"}
+        else{
+          const d=await r.json();
+          $("#transcriptMeta").textContent=`${d.count} 段 · ${d.language||"-"}`;
+          $("#transcriptBody").innerHTML=(d.segments||[]).map(s=>
+            `<div><span style="color:var(--accent);font-family:monospace">${hms(s.start_ms)}</span> ${esc(s.text)}</div>`
+          ).join("")||"（无转写内容）";
+        }
+      }catch(err){$("#transcriptBody").textContent="加载失败："+err}
+    }
+    box.style.display="block";$("#toggleTranscript").textContent="📝 收起转写";
+  }else{
+    box.style.display="none";$("#toggleTranscript").textContent="📝 转写结果";
+  }
+};
 
 /* ---------- 视频库 ---------- */
 async function loadLibrary(){
@@ -266,16 +333,48 @@ async function loadLibrary(){
     tr.innerHTML=`<td>${esc(v.title||v.display_name||v.video_id)}</td>
       <td><span class="pill ${ready?"ready":v.status==="failed"?"failed":"other"}">${esc(v.status)}</span></td>
       <td>${hms(v.duration_ms)}</td><td>-</td><td>${esc(v.language||"-")}</td>
-      <td>${ready?`<a class="tlink" href="/chat?video_id=${v.video_id}">💬 对话</a>
+      <td>${ready?`<a class="tlink" href="#" data-act="report" data-id="${v.video_id}">📋 报告</a>
+                   <a class="tlink" href="/chat?video_id=${v.video_id}">💬 对话</a>
+                   <a class="tlink" href="#" data-act="sub" data-fmt="srt" data-id="${v.video_id}">SRT</a>
+                   <a class="tlink" href="#" data-act="sub" data-fmt="vtt" data-id="${v.video_id}">VTT</a>
                    <a class="tlink" href="#" data-act="del" data-id="${v.video_id}">删除</a>`
                  :`<a class="tlink" href="#" data-act="del" data-id="${v.video_id}">删除</a>`}</td>`;
     body.appendChild(tr);
   }
+  body.querySelectorAll('[data-act="report"]').forEach(a=>a.onclick=async e=>{
+    e.preventDefault(); const id=a.dataset.id;
+    try{
+      const r=await fetch(`/api/videos/${id}/report`,{headers:H()});
+      if(!r.ok){toast((await r.json().catch(()=>({}))).detail||"报告读取失败");return}
+      showResult({status:"done",report:await r.json()});
+      // 切到「分析」页签并滚到结果卡
+      $$(".tabs button").forEach(x=>x.classList.toggle("on",x.dataset.t==="analyze"));
+      $$(".tabpane").forEach(p=>p.classList.toggle("on",p.id==="p-analyze"));
+      $("#resultCard").scrollIntoView({behavior:"smooth",block:"start"});
+    }catch(err){toast("报告读取失败："+err)}
+  });
   body.querySelectorAll('[data-act="del"]').forEach(a=>a.onclick=async e=>{
     e.preventDefault(); const id=a.dataset.id;
     if(!confirm("删除视频 "+id+" 及其切片/关键帧/向量？"))return;
     await fetch("/api/videos/"+id,{method:"DELETE",headers:H()});
     toast("已删除"); loadLibrary();
+  });
+  body.querySelectorAll('[data-act="sub"]').forEach(a=>a.onclick=async e=>{
+    e.preventDefault();
+    const id=a.dataset.id, fmt=a.dataset.fmt;
+    try{
+      const r=await fetch(`/api/videos/${id}/subtitles?format=${fmt}`,{headers:H()});
+      if(!r.ok){toast((await r.json().catch(()=>({}))).detail||"导出失败");return}
+      const cd=r.headers.get("Content-Disposition")||"";
+      const m=cd.match(/filename\*=UTF-8''([^;]+)/);
+      let name=m?decodeURIComponent(m[1]):`${id}.${fmt}`;
+      const blob=await r.blob();
+      const url=URL.createObjectURL(blob);
+      const link=document.createElement("a");
+      link.href=url; link.download=name; link.click();
+      URL.revokeObjectURL(url);
+      toast("已导出 "+name);
+    }catch(err){toast("导出失败："+err)}
   });
 }
 $("#refreshLib").onclick=loadLibrary;

@@ -28,13 +28,16 @@ import hmac
 import json
 import logging
 import os
+import re
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Final, Iterator, Literal
+from urllib.parse import quote
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import (
     FileResponse,
     JSONResponse,
@@ -487,6 +490,52 @@ def _hms(ms: int) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}"
 
 
+# -- 字幕导出 --------------------------------------------------------------- #
+
+
+def _srt_ts(ms: int) -> str:
+    """毫秒 → SRT 时间戳（``HH:MM:SS,mmm``，逗号是标准要求）。"""
+    total = max(0, int(ms))
+    hours, rest = divmod(total, 3_600_000)
+    minutes, rest = divmod(rest, 60_000)
+    seconds, millis = divmod(rest, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def _vtt_ts(ms: int) -> str:
+    """毫秒 → WebVTT 时间戳（``HH:MM:SS.mmm``）。"""
+    return _srt_ts(ms).replace(",", ".")
+
+
+def _build_srt(segments: Sequence[Any]) -> str:
+    """转写片段 → SRT 文本。空文本段跳过，时间倒挂段至少给 1s。"""
+    blocks: list[str] = []
+    for seg in segments:
+        text = str(getattr(seg, "text", "") or "").strip()
+        if not text:
+            continue
+        start = int(getattr(seg, "start_ms", 0) or 0)
+        end = max(int(getattr(seg, "end_ms", 0) or 0), start + 1000)
+        blocks.append(f"{len(blocks) + 1}\n{_srt_ts(start)} --> {_srt_ts(end)}\n{text}")
+    return "\n\n".join(blocks) + ("\n" if blocks else "")
+
+
+def _build_vtt(segments: Sequence[Any]) -> str:
+    """转写片段 → WebVTT 文本（时间戳用点号，块结构直接复用 SRT 生成器）。"""
+    srt = _build_srt(segments)
+    if not srt:
+        return "WEBVTT\n"
+    return "WEBVTT\n\n" + re.sub(r"(\d{2}:\d{2}:\d{2}),(\d{3})", r"\1.\2", srt)
+
+
+def _subtitle_filename(title: str, video_id: str, fmt: str) -> str:
+    """导出文件名：优先标题，剔除文件系统非法字符；兜底 video_id。"""
+    base = re.sub(r"^https?://(www\.)?", "", title.strip())
+    base = "".join(c for c in base if c not in '\\/:*?"<>|').strip()
+    base = base or video_id
+    return f"{base}.{fmt}"
+
+
 def _answer_out(result: AskResult) -> AnswerOut:
     return AnswerOut(
         question=result.question,
@@ -749,6 +798,88 @@ def create_router(cfg: AppConfig | None = None) -> APIRouter:
     def video_clips(request: Request, video_id: str) -> list[ClipOut]:
         orch = _orchestrator(request)
         return [_clip_out(c) for c in orch.repository.get_clips(video_id)]
+
+    @router.get(
+        "/videos/{video_id}/subtitles",
+        tags=["videos"],
+        summary="导出字幕文件（format=srt|vtt，默认 srt）",
+        dependencies=[auth],
+    )
+    def video_subtitles(
+        request: Request,
+        video_id: str,
+        fmt: Literal["srt", "vtt"] = Query("srt", alias="format"),
+    ) -> Response:
+        orch = _orchestrator(request)
+        try:
+            record = orch.repository.find_video(video_id)
+        except StorageError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"视频不存在: {video_id}")
+        segments = orch.repository.get_segments(video_id)
+        if not segments:
+            raise HTTPException(status_code=404, detail="该视频没有可导出的转写片段")
+        text = _build_srt(segments) if fmt == "srt" else _build_vtt(segments)
+        filename = _subtitle_filename(str(getattr(record, "title", "") or ""), video_id, fmt)
+        quoted = quote(filename)
+        return Response(
+            content=text,
+            media_type="application/x-subrip" if fmt == "srt" else "text/vtt; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f"attachment; filename*=UTF-8''{quoted}"
+                )
+            },
+        )
+
+    @router.get(
+        "/videos/{video_id}/transcript",
+        tags=["videos"],
+        summary="转写片段列表（JSON，供界面展示转写结果）",
+        dependencies=[auth],
+    )
+    def video_transcript(request: Request, video_id: str) -> dict[str, Any]:
+        orch = _orchestrator(request)
+        try:
+            record = orch.repository.find_video(video_id)
+        except StorageError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"视频不存在: {video_id}")
+        segments = orch.repository.get_segments(video_id)
+        return {
+            "video_id": video_id,
+            "language": str(getattr(record, "language", "") or ""),
+            "count": len(segments),
+            "segments": [
+                {
+                    "index": s.index_no,
+                    "start_ms": s.start_ms,
+                    "end_ms": s.end_ms,
+                    "text": s.text,
+                }
+                for s in segments
+            ],
+        }
+
+    @router.get(
+        "/videos/{video_id}/report",
+        tags=["videos"],
+        summary="上次分析的持久化报告（重启后仍可查）",
+        dependencies=[auth],
+    )
+    def video_report(request: Request, video_id: str) -> dict[str, Any]:
+        orch = _orchestrator(request)
+        try:
+            report = orch.repository.get_video_report(video_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except StorageError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        if report is None:
+            raise HTTPException(status_code=404, detail="该视频还没有已保存的分析报告")
+        return report
 
     @router.get(
         "/videos/{video_id}/keyframes",

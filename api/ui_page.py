@@ -70,7 +70,7 @@ def create_ui_router(cfg: Any = None) -> APIRouter:
     @router.post("/api/settings", tags=["settings"], summary="保存网页设置（白名单校验）")
     def post_settings(request: Request, payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
         _orch(request)
-        from core.config import get_app_config, load_app_config  # noqa: PLC0415
+        from core.config import get_app_config  # noqa: PLC0415
 
         try:
             save_settings(dict(payload))
@@ -82,7 +82,7 @@ def create_ui_router(cfg: Any = None) -> APIRouter:
         # 重启服务后全面生效（与原 Gradio 设置页"保存即重建"相比保守，
         # 但语义诚实——见状态页提示）。
         try:
-            fresh = load_app_config(force_reload=True)
+            fresh = get_app_config(force_reload=True)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=422, detail=f"保存成功但配置校验失败: {exc}") from exc
         app_cfg = getattr(request.app.state, "config", None) or get_app_config()
