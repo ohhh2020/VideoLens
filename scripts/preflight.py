@@ -27,6 +27,7 @@ import importlib.util
 import json
 import shutil
 import socket
+import subprocess
 import sys
 import time
 import traceback
@@ -321,6 +322,54 @@ def check_deps(rep: Report) -> None:
         rep.add("DEPS", OK, f"{present}/{total}")
 
 
+def check_gpu(rep: Report) -> None:
+    """有 N 卡却装着 CPU 推理栈时给出明确指引（不 import torch，读元数据即可）。
+
+    实测事故：机器有 RTX 5060，但 torch/llama-cpp-python 都是 PyPI 默认的
+    CPU 轮子 —— 全链路在 CPU 上爬，用户只觉得"慢到离谱"却无从得知原因。
+    """
+    exe = shutil.which("nvidia-smi")
+    if exe is None:
+        rep.add("GPU", OK, "未检测到 NVIDIA GPU（CPU 模式）")
+        return
+    try:
+        proc = subprocess.run(  # noqa: S603 - 固定程序名
+            [exe, "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10, check=False,
+            encoding="utf-8", errors="replace",
+        )
+        name = (proc.stdout or "").strip().splitlines()[0].strip() if proc.returncode == 0 else ""
+    except Exception:  # noqa: BLE001
+        name = ""
+    if not name:
+        rep.add("GPU", SKIP, "nvidia-smi 存在但读取失败")
+        return
+    # torch 可能装在两处：当前环境（pip 常规安装）或项目 runtime/（setup_gpu.py
+    # 的隔离安装）。先挂 runtime 路径再 import —— 没有任何可用 torch 才算未装。
+    try:
+        sys.path.insert(0, str(_ROOT))
+        from core.models._runtime import ensure_torch_path  # noqa: PLC0415
+
+        ensure_torch_path()
+        import torch  # noqa: PLC0415
+
+        torch_ver = getattr(torch, "__version__", "")
+        cuda_ok = bool(torch.cuda.is_available())
+    except Exception:  # noqa: BLE001 - 环境与 runtime 都没有可用 torch
+        rep.add("GPU", OK, f"{name}（torch 未装，向量链路本来就要装）")
+        return
+    if not cuda_ok:
+        rep.add(
+            "GPU",
+            WARN,
+            f"{name} 存在，但 torch {torch_ver} 是 CPU 构建",
+            note="运行 python scripts/setup_gpu.py 一键切换 GPU 推理栈"
+                 "（向量编码约快 5-10 倍；脚本同时检查 llama-cpp-python）",
+        )
+    else:
+        rep.add("GPU", OK, f"{name}（torch {torch_ver}，CUDA 构建）")
+
+
 def check_models(rep: Report, cfg: Any) -> None:
     """检查五类角色各自配置的模型是否已落盘。"""
     if cfg is None:
@@ -584,6 +633,7 @@ _TITLES = {
     "FFMPEG": "FFmpeg",
     "FFPROBE": "FFprobe",
     "DEPS": "依赖包",
+    "GPU": "GPU 推理栈",
     "ASR_MODEL": "语音转写模型",
     "EMB_MODEL": "文本向量模型",
     "IMG_MODEL": "图像向量模型",
@@ -663,6 +713,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         cfg = check_config(rep, config_path=args.config)
         check_ffmpeg(rep, cfg)
         check_deps(rep)
+        check_gpu(rep)
         check_models(rep, cfg)
         check_storage(rep, cfg)
         check_vectors(rep, cfg)

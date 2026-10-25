@@ -128,7 +128,7 @@ VideoStatus = Literal[
 
 TaskStatus = Literal["pending", "running", "done", "failed", "cancelled"]
 
-SCHEMA_VERSION: Final[int] = 3
+SCHEMA_VERSION: Final[int] = 4
 
 #: 表名 → ``storage.limits`` 里对应的上限字段
 _LIMIT_MAP: Final[dict[str, str]] = {
@@ -583,7 +583,29 @@ _DDL_V3: Final[tuple[str, ...]] = (
     "ALTER TABLE videos ADD COLUMN vector_generation TEXT NOT NULL DEFAULT ''",
 )
 
-_MIGRATIONS: Final[dict[int, tuple[str, ...]]] = {1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3}
+# ===== v4：多轮问答历史（持久化，重启不丢）=====
+_DDL_V4: Final[tuple[str, ...]] = (
+    """
+    CREATE TABLE IF NOT EXISTS qa_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      video_id TEXT NOT NULL,
+      question TEXT NOT NULL,
+      answer TEXT NOT NULL,
+      refs TEXT NOT NULL DEFAULT '[]',
+      rewritten TEXT NOT NULL DEFAULT '',
+      elapsed_ms INTEGER NOT NULL DEFAULT 0,
+      session_id TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      created_ts REAL NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_qa_video ON qa_history(video_id, created_ts)",
+    "CREATE INDEX IF NOT EXISTS idx_qa_session ON qa_history(session_id)",
+)
+
+_MIGRATIONS: Final[dict[int, tuple[str, ...]]] = {
+    1: _DDL_V1, 2: _DDL_V2, 3: _DDL_V3, 4: _DDL_V4,
+}
 
 # =============================================================================
 # 仓库
@@ -1487,6 +1509,126 @@ class SqliteRepository:
 
     def pending_tasks(self, limit: int = 50) -> list[TaskRecord]:
         return self.list_tasks(status="pending", limit=limit)
+
+    # -- qa_history（多轮问答持久化）----------------------------------------
+
+    def add_qa(
+        self,
+        video_id: str,
+        *,
+        question: str,
+        answer: str,
+        refs: Sequence[Mapping[str, Any]] | None = None,
+        rewritten: str = "",
+        elapsed_ms: int = 0,
+        session_id: str = "",
+        keep_per_video: int = 20,
+    ) -> int:
+        """记录一轮问答，返回行 id。同视频超过 ``keep_per_video`` 轮时裁最旧。"""
+        import json as _json
+
+        now_iso = _now_iso()
+        with self._tx() as conn:
+            cur = conn.execute(
+                "INSERT INTO qa_history (video_id, question, answer, refs, rewritten,"
+                " elapsed_ms, session_id, created_at, created_ts)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    video_id, question, answer,
+                    _json.dumps(list(refs or []), ensure_ascii=False, default=str),
+                    rewritten, max(0, int(elapsed_ms)), session_id,
+                    now_iso, _now_epoch(),
+                ),
+            )
+            row_id = int(cur.lastrowid or 0)
+            conn.execute(
+                "DELETE FROM qa_history WHERE video_id=? AND id NOT IN ("
+                "  SELECT id FROM qa_history WHERE video_id=?"
+                "  ORDER BY created_ts DESC LIMIT ?"
+                ")",
+                (video_id, video_id, max(1, int(keep_per_video))),
+            )
+        return row_id
+
+    def list_qa(
+        self, video_id: str | None = None, *, session_id: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """按时间升序列出问答历史（refs 自动反序列化）。"""
+        import json as _json
+
+        sql = "SELECT * FROM qa_history"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if video_id:
+            clauses.append("video_id=?")
+            params.append(video_id)
+        if session_id:
+            clauses.append("session_id=?")
+            params.append(session_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_ts ASC LIMIT ?"
+        params.append(max(1, int(limit)))
+        out: list[dict[str, Any]] = []
+        for row in self._query(sql, params):
+            try:
+                refs = _json.loads(row["refs"] or "[]")
+            except Exception:  # noqa: BLE001
+                refs = []
+            out.append({
+                "id": int(row["id"]),
+                "video_id": row["video_id"],
+                "question": row["question"],
+                "answer": row["answer"],
+                "refs": refs,
+                "rewritten": row["rewritten"],
+                "elapsed_ms": int(row["elapsed_ms"]),
+                "session_id": row["session_id"],
+                "created_at": row["created_at"],
+            })
+        return out
+
+    def list_qa_sessions(self, video_id: str | None = None, *, limit: int = 50) -> list[dict[str, Any]]:
+        """按会话聚合（session_id 为空的历史归入 ``legacy`` 一组）。"""
+        sql = (
+            "SELECT video_id, session_id, COUNT(*) AS turns, MAX(created_ts) AS last_ts"
+            " FROM qa_history"
+        )
+        clauses: list[str] = []
+        params: list[Any] = []
+        if video_id:
+            clauses.append("video_id=?")
+            params.append(video_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " GROUP BY video_id, session_id ORDER BY last_ts DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        return [
+            {
+                "video_id": r["video_id"],
+                "session_id": r["session_id"] or "legacy",
+                "turns": int(r["turns"]),
+                "last_ts": float(r["last_ts"]),
+            }
+            for r in self._query(sql, params)
+        ]
+
+    def clear_qa(self, video_id: str | None = None, *, session_id: str | None = None) -> int:
+        """清空问答历史（全库 / 指定视频 / 指定会话），返回删除条数。"""
+        sql = "DELETE FROM qa_history"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if video_id:
+            clauses.append("video_id=?")
+            params.append(video_id)
+        if session_id:
+            clauses.append("session_id=?")
+            params.append(session_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        with self._tx() as conn:
+            cur = conn.execute(sql, params)
+            return cur.rowcount
 
     # -- artifacts ---------------------------------------------------------
 

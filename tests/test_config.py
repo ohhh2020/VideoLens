@@ -70,7 +70,7 @@ check("YAML 与默认值一致", diff == {}, json.dumps(diff, ensure_ascii=False
 # --------------------------------------------------------------------------- #
 payload = cfg.to_dict()
 check("to_dict 无运行时分部", "root_dir" not in payload and "source_file" not in payload)
-check("17 个顶层段", len(payload) == 17, f"{sorted(payload)}")
+check("19 个顶层段", len(payload) == 19, f"{sorted(payload)}")
 try:
     blob = json.dumps(payload, ensure_ascii=False)
     check("to_dict JSON 可序列化", len(blob) > 2000, f"{len(blob)} chars")

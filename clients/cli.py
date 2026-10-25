@@ -322,7 +322,7 @@ class LocalBackend:
         return self.orch.summarize(video_id)
 
     def chapters(self, video_id: str, *, chapter_seconds: int = 300,
-                 min_seconds: int = 600, summarize: bool = True) -> dict[str, Any]:
+                 min_seconds: int = 300, summarize: bool = True) -> dict[str, Any]:
         rows = self.orch.chapters(
             video_id,
             chapter_seconds=chapter_seconds,
@@ -337,7 +337,7 @@ class LocalBackend:
         }
 
     def chapter_report(self, video_id: str, *, chapter_seconds: int = 300,
-                       min_seconds: int = 600) -> str:
+                       min_seconds: int = 300) -> str:
         return self.orch.chapter_report(
             video_id, chapter_seconds=chapter_seconds, min_seconds=min_seconds
         )
@@ -488,7 +488,7 @@ class RemoteBackend:
         return str(payload.get("summary") or "")
 
     def chapters(self, video_id: str, *, chapter_seconds: int = 300,
-                 min_seconds: int = 600, summarize: bool = True) -> dict[str, Any]:
+                 min_seconds: int = 300, summarize: bool = True) -> dict[str, Any]:
         return self._request(
             "GET",
             f"/api/videos/{video_id}/chapters",
@@ -500,7 +500,7 @@ class RemoteBackend:
         )
 
     def chapter_report(self, video_id: str, *, chapter_seconds: int = 300,
-                       min_seconds: int = 600) -> str:
+                       min_seconds: int = 300) -> str:
         return self._request(
             "GET",
             f"/api/videos/{video_id}/chapters/report",

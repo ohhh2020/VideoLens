@@ -84,6 +84,23 @@ logger = logging.getLogger("zhiying.pipeline.orchestrator")
 _INFERENCE_LOCK: Final[threading.RLock] = threading.RLock()
 _INFERENCE_POLL_S: Final[float] = 0.2
 
+#: 同一 video_id 的分析互斥（类级注册表：设置页重建编排器后依然生效）。
+#: 没有它，用户在界面上把同一个视频点两次，两条完整流水线会并行互踩 ——
+#: 全局推理锁让它们互相排队（实测一个 5 分钟视频被拖成 20+ 分钟），
+#: 转写/抽帧/视觉理解全部算两遍。串行化之后，后到者等先到者完成，
+#: 再走"已分析完成/断点恢复"的快路径，代价接近零。
+_VIDEO_LOCKS: Final[dict[str, threading.Lock]] = {}
+_VIDEO_LOCKS_GUARD = threading.Lock()
+
+
+def _video_lock(video_id: str) -> threading.Lock:
+    with _VIDEO_LOCKS_GUARD:
+        lock = _VIDEO_LOCKS.get(video_id)
+        if lock is None:
+            lock = threading.Lock()
+            _VIDEO_LOCKS[video_id] = lock
+        return lock
+
 __all__ = [
     "AnalysisReport",
     "AnalyzeOptions",
@@ -267,6 +284,9 @@ class AnalysisReport:
     duration_ms: int = 0
     summary: str = ""
     summary_backend: str = ""
+    #: 内容画像（方案 A）：speech_ratio / scene_density / high_motion /
+    #: vision_mode_used —— 前端可见"这段视频按什么策略分析"。
+    profile: dict[str, Any] = field(default_factory=dict)
     degraded: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -295,6 +315,7 @@ class AnalysisReport:
             "vector_count": self.vector_count,
             "transcript_source": self.transcript_source,
             "language": self.language,
+            "profile": dict(self.profile),
             "summary": self.summary,
             "summary_backend": self.summary_backend,
             "degraded": list(self.degraded),
@@ -319,6 +340,8 @@ class AskResult:
     notes: list[str] = field(default_factory=list)
     context_chars: int = 0
     candidates: int = 0
+    #: 本轮归属的会话（/chat 页每段对话一个 id；空=未分组的历史）
+    session_id: str = ""
 
     @property
     def ok(self) -> bool:
@@ -336,6 +359,7 @@ class AskResult:
             "notes": list(self.notes),
             "context_chars": self.context_chars,
             "candidates": self.candidates,
+            "session_id": self.session_id,
         }
 
 
@@ -429,6 +453,9 @@ class Orchestrator:
         # 不缓存的话每次提问都要对整库切片重新分词（1 小时视频约 180 片）。
         self._bm25_cache: OrderedDict[str, tuple[tuple[str, int, str], Any]] = OrderedDict()
         self._bm25_lock = threading.Lock()
+        #: 最近一次视觉描述实际走的模式（segments/frames[-downgraded]），
+        #: 写进 report.profile.vision_mode_used 供前端与验收查看。
+        self._last_vision_mode: str = ""
 
     # -- 只读组件访问（客户端/接口层列数据时用，避免到处摸下划线属性）------
 
@@ -543,6 +570,7 @@ class Orchestrator:
 
         video_id = ""
         ctx: dict[str, Any] = {}
+        video_guard: threading.Lock | None = None
 
         try:
             # ---------------- parse ----------------
@@ -552,6 +580,15 @@ class Orchestrator:
             report.video_id = video_id
             report.title = opts.title or media_source.display_name
             ctx["source"] = media_source
+
+            # 同视频串行：后来者等先到者完成后走快路径（复用结果/断点续跑），
+            # 绝不并行跑两条全量流水线。见 _VIDEO_LOCKS 的注释。
+            video_guard = _video_lock(video_id)
+            if not video_guard.acquire(timeout=0.5):
+                logger.info("video_id=%s 已有分析在运行，排队等待其完成", video_id)
+                report.warnings.append("同视频已有任务在运行，已排队等待（未重复计算）")
+                video_guard.acquire()
+
             existing = self._repo.find_video(video_id)
             if existing and existing.status == "ready" and not opts.force:
                 self._finish(stage, message="视频已分析完成，跳过（force=True 可重跑）")
@@ -638,6 +675,23 @@ class Orchestrator:
             report.warnings.extend(scene_warnings)
             self._finish(stage, message=f"{len(scenes)} 个场景（{detector_used}）")
 
+            # 内容画像（方案 A 最小实现）：高运动判定驱动视觉分派
+            duration_s = max(1.0, (report.duration_ms or 0) / 1000.0)
+            scene_density = len(scenes) / (duration_s / 60.0)
+            speech_ms = sum(
+                max(0, int(getattr(s, "end_ms", 0) or 0) - int(getattr(s, "start_ms", 0) or 0))
+                for s in segments
+            )
+            high_motion = scene_density >= float(self._cfg.vl.high_motion_density_per_min)
+            profile = {
+                "scene_count": len(scenes),
+                "scene_density_per_min": round(scene_density, 1),
+                "speech_ratio": round(min(1.0, speech_ms / max(1, report.duration_ms or 1)), 3),
+                "transcript_source": report.transcript_source,
+                "high_motion": high_motion,
+            }
+            ctx["profile"] = profile
+
             # ---------------- chunk ----------------
             stage = self._begin(report, Stage.CHUNK, progress)
             clips = resume_ctx.get("clips")
@@ -663,8 +717,11 @@ class Orchestrator:
             reused = self._resumable(Stage.VISION, resume_from, keyframes)
             if not reused:
                 keyframes = self._extract_keyframes(
-                    local_path, video_id, scenes, clips, opts, report
+                    local_path, video_id, scenes, clips, opts, report,
+                    high_motion=high_motion,
                 )
+            profile["vision_mode_used"] = getattr(self, "_last_vision_mode", "")
+            report.profile = profile
             ctx["keyframes"] = keyframes
             report.keyframe_count = len(keyframes)
             if reused:
@@ -715,6 +772,9 @@ class Orchestrator:
                     )
                 except Exception:  # noqa: BLE001
                     logger.debug("记录失败状态时再次出错", exc_info=True)
+        finally:
+            if video_guard is not None:
+                video_guard.release()
 
         report.elapsed_ms = int((time.monotonic() - started) * 1000)
         return report
@@ -726,47 +786,111 @@ class Orchestrator:
         *,
         top_k: int | None = None,
         max_context_tokens: int | None = None,
+        session_id: str = "",
     ) -> AskResult:
-        """基于已索引视频回答一个问题。**不抛异常**。"""
+        """基于已索引视频回答一个问题。**不抛异常**。
+
+        ``session_id``：会话分组（/chat 页每段对话一个）；空则历史归入 legacy 组。
+        """
+        for kind, payload in self._ask_impl(
+            video_id, question, top_k=top_k,
+            max_context_tokens=max_context_tokens, stream=False,
+            session_id=session_id,
+        ):
+            if kind == "final":
+                return payload
+        return AskResult(question=question, video_id=video_id)
+
+    def ask_stream(
+        self,
+        video_id: str,
+        question: str,
+        *,
+        top_k: int | None = None,
+        max_context_tokens: int | None = None,
+        session_id: str = "",
+    ) -> Iterator[tuple[str, Any]]:
+        """流式问答：逐 token 产出，最后 yield 定稿结果。
+
+        事件序列：``("meta", {...})`` → 若干 ``("delta", str)`` →
+        ``("final", AskResult)``。证据校验（claims）在收尾统一做 —— 流式
+        期间的增量可能含被事后撕掉的编号，客户端应以 final 为准替换全文。
+        LLM 不支持流式时退化为单个 delta（一次性全文），接口形状不变。
+        """
+        yield from self._ask_impl(
+            video_id, question, top_k=top_k,
+            max_context_tokens=max_context_tokens, stream=True,
+            session_id=session_id,
+        )
+
+    def _ask_impl(
+        self,
+        video_id: str,
+        question: str,
+        *,
+        top_k: int | None,
+        max_context_tokens: int | None,
+        stream: bool,
+        session_id: str = "",
+    ) -> Iterator[tuple[str, Any]]:
+        """ask / ask_stream 的共享实现（检索→组装→生成→校验）。
+
+        恒为生成器且以 ``("final", AskResult)`` 收尾；``stream=False`` 时
+        不产出 meta/delta，只给 final（ask() 的消费形态）。
+        """
         started = time.monotonic()
         result = AskResult(question=question, video_id=video_id)
         text = (question or "").strip()
         if not text:
             result.notes.append("问题为空")
-            return result
-
+            yield ("final", result)
+            return
         video = self._repo.find_video(video_id)
         if video is None:
             result.notes.append(f"视频不存在: {video_id}")
-            return result
+            yield ("final", result)
+            return
 
-        # 1) 检索
+        # ---- 多轮（C 端对话）----
+        # 1) 查询改写：追问常带指代/省略（"那第二个进球呢"），坏查询直接
+        #    召回坏证据 —— 改写发生在检索之前，用上一轮问答补全。
+        # 2) 历史前缀：最近 N 轮作为 messages 前缀传给 LLM（证据只挂本轮）。
+        from core.pipeline.chat_sessions import get_chat_store  # noqa: PLC0415
+
+        store = get_chat_store()
+        history = store.history(video_id)
+        retrieval_query = text
+        if history and self._cfg.qa.query_rewrite:
+            rewritten = self._rewrite_query(text, history)
+            if rewritten:
+                retrieval_query = rewritten
+                result.notes.append(f"追问已改写检索: {rewritten[:60]}")
+
         try:
-            items = self._retrieve(video_id, text, top_k)
+            items = self._retrieve(video_id, retrieval_query, top_k)
         except Exception as exc:  # noqa: BLE001
             logger.warning("检索失败，退化为时间线摘要: %s", exc)
             result.notes.append(f"检索失败: {exc}")
             items = []
         result.candidates = len(items)
-
         if not items:
             items = self._fallback_items(video_id)
             result.notes.append("检索无命中，改用片段摘录作为证据")
             result.degraded = True
-
-        # 把命中关键帧的画面描述拼进证据：图像通道能检索到帧，
-        # 但帧里"有什么颜色、写着什么字"必须变成文字 LLM 才看得到。
         items = self._attach_visuals(video_id, items)
 
-        # 2) 组装上下文
         builder = self._ctx or _build_context(self._cfg)
         if max_context_tokens:
             from core.pipeline.context_builder import (  # noqa: PLC0415
                 ContextBudget,
                 ContextBuilder,
             )
+            from core.prompts import get_prompt_registry  # noqa: PLC0415
 
-            builder = ContextBuilder(ContextBudget(max_tokens=max_context_tokens))
+            builder = ContextBuilder(
+                ContextBudget(max_tokens=max_context_tokens),
+                prompts=get_prompt_registry(),
+            )
         built = builder.build(
             items, text, video_title=video.title or video.display_name or "该视频"
         )
@@ -774,41 +898,158 @@ class Orchestrator:
         result.notes.extend(built.notes)
         if not built.ok:
             result.notes.append("上下文组装为空，无法生成回答")
-            return result
+            yield ("final", result)
+            return
 
-        # 3) 生成
+        if stream:
+            yield ("meta", {
+                "video_id": video_id,
+                "candidates": result.candidates,
+                "context_chars": result.context_chars,
+                "backend_hint": getattr(self._llm, "primary", "") if self._llm is not None else "",
+            })
+
         llm = self._llm or _build_llm(self._cfg, None)
+        answer_parts: list[str] = []
+        generated = False
+        resp: Any = None
+        stream_fn = getattr(llm, "stream", None)
+        # 多轮生成：历史轮作为前缀（只保留问答文本），证据 prompt 永远是
+        # 最后一条 user 消息 —— 引用编号只对应本轮检索结果，跨轮不串。
+        history_window = int(self._cfg.qa.history_window)
+        prefix = history[-history_window * 2:] if history else []
+        gen_messages = [*prefix, {"role": "user", "content": built.text}]
         try:
-            with self._inference_slot("回答问题", None):
-                response = llm.complete([{"role": "user", "content": built.text}])
-            result.answer = response.text
-            result.backend = response.backend
-            result.degraded = result.degraded or response.degraded
-        except Exception as exc:  # noqa: BLE001
+            if stream and callable(stream_fn):
+                with self._inference_slot("回答问题", None):
+                    for piece in stream_fn(gen_messages):
+                        answer_parts.append(str(piece))
+                        yield ("delta", str(piece))
+                raw_answer = "".join(answer_parts)
+                generated = bool(raw_answer.strip())
+                if not generated:
+                    raise RuntimeError("流式输出为空")
+            else:
+                with self._inference_slot("回答问题", None):
+                    resp = llm.complete(gen_messages)
+                raw_answer = resp.text
+                generated = bool(raw_answer.strip())
+                if stream and generated:
+                    # 后端不支持流式（如注入的 Fake LLM / keywords 兜底）：
+                    # 一次性吐全文，接口形状不变，首 token 延迟=总延迟。
+                    answer_parts = [raw_answer]
+                    yield ("delta", raw_answer)
+        except Exception as exc:  # noqa: BLE001 - 生成失败退化为证据罗列
             logger.warning("LLM 生成失败: %s", exc)
             result.notes.append(f"LLM 不可用: {exc}")
-            result.answer = _evidence_only_answer(built)
+            raw_answer = _evidence_only_answer(built)
             result.backend = "evidence"
             result.degraded = True
+            if stream and not answer_parts:
+                yield ("delta", raw_answer)
+        else:
+            if resp is not None:
+                result.backend = resp.backend
+                result.degraded = result.degraded or resp.degraded
+            elif generated:
+                result.backend = getattr(llm, "primary", "stream")
 
+        result.answer = raw_answer
         result.refs = extract_citations(result.answer, built.refs)
-        # 4) 证据校验：撕掉模型编造的编号、给孤立句补出处。
-        # 编号必须在"引用映射"之前定稿，否则 extract_citations 会把一个
-        # 不存在的 [3] 之后的所有编号整体错位。
         result.answer = _enforce_answer_claims(result, built)
         result.refs = extract_citations(result.answer, built.refs)
         result.elapsed_ms = int((time.monotonic() - started) * 1000)
-        return result
+        # 记忆本轮：内存 LRU（供多轮前缀）+ SQLite 持久化（重启不丢）。
+        # session_id 由调用方经 AnalyzeOptions 传入（/chat 页每段对话一个），
+        # 空则归入 legacy 组。持久化失败不影响返回。
+        persisted = False
+        if history or self._cfg.qa.multi_turn:
+            try:
+                from core.pipeline.chat_sessions import Turn  # noqa: PLC0415
 
-    def summarize(self, video_id: str, *, max_items: int = 12) -> str:
-        """重新生成整片总结（不重跑分析）。"""
+                store.remember(video_id, Turn(
+                    question=text, answer=result.answer,
+                    rewritten=retrieval_query if retrieval_query != text else "",
+                    elapsed_ms=result.elapsed_ms,
+                ))
+            except Exception:  # noqa: BLE001
+                logger.debug("会话记忆失败", exc_info=True)
+        try:
+            self._repo.add_qa(
+                video_id,
+                question=text,
+                answer=result.answer,
+                refs=[r.to_dict() for r in result.refs],
+                rewritten=retrieval_query if retrieval_query != text else "",
+                elapsed_ms=result.elapsed_ms,
+                session_id=session_id,
+            )
+            persisted = True
+        except Exception:  # noqa: BLE001 - 持久化是尽力而为
+            logger.debug("问答历史落库失败", exc_info=True)
+        result.notes.append("已存历史" if persisted else "历史未落库")
+        result.session_id = session_id
+        yield ("final", result)
+
+    def _rewrite_query(self, question: str, history: list[dict[str, str]]) -> str:
+        """多轮查询改写：用上一轮问答把追问补全成独立查询。
+
+        改写失败/输出异常时返回空串（调用方退回原问题），绝不让这步
+        可选优化阻断问答主链路。
+        """
+        try:
+            last_q = ""
+            last_a = ""
+            for msg in reversed(history):
+                if msg.get("role") == "user" and not last_q:
+                    last_q = str(msg.get("content", ""))
+                elif msg.get("role") == "assistant" and not last_a:
+                    last_a = str(msg.get("content", ""))
+                if last_q and last_a:
+                    break
+            if not last_q:
+                return ""
+            from core.prompts import get_prompt_registry  # noqa: PLC0415
+
+            llm = self._llm or _build_llm(self._cfg, None)
+            prompt = get_prompt_registry().render(
+                "chat_query_rewrite",
+                last_question=last_q[:300],
+                last_answer=last_a[:600],
+                question=question[:300],
+            )
+            with self._inference_slot("查询改写", None):
+                resp = llm.complete(
+                    [{"role": "user", "content": prompt}],
+                    max_tokens=120, temperature=0.0,
+                )
+            out = str(resp.text or "").strip().strip('"“”‘’').strip()
+            # 违约防护：改写结果异常长（模型开始解释）或与原问一样时弃用
+            if not out or len(out) > 200 or out == question:
+                return ""
+            return out[:200]
+        except Exception as exc:  # noqa: BLE001 - 改写是可选优化
+            logger.debug("查询改写失败，使用原问题: %s", exc)
+            return ""
+
+    def summarize(self, video_id: str, *, max_items: int | None = None) -> str:
+        """重新生成整片总结（不重跑分析）。
+
+        ``max_items=None``（默认）跟随"覆盖全片"预算；显式传值用于裁剪。
+        """
         video = self._repo.find_video(video_id)
         if video is None:
             raise PipelineError(f"视频不存在: {video_id}")
         payloads = list(self._repo.iter_clip_payloads(video_id))
         payloads = self._attach_visuals(video_id, payloads)
-        builder = self._ctx or _build_context(self._cfg)
-        built = builder.build_summary(
+        from core.pipeline.context_builder import ContextBuilder  # noqa: PLC0415
+        from core.prompts import get_prompt_registry  # noqa: PLC0415
+
+        # 与分析期的 _summarize 同一套"覆盖全片"预算（历史 bug：这里沿用
+        # 问答的 8 条预算 + 兜底提示词，重新生成的总结与分析期一样被压扁）。
+        built = ContextBuilder(
+            _summary_budget(len(payloads)), prompts=get_prompt_registry()
+        ).build_summary(
             payloads,
             video_title=video.title or video.display_name,
             duration_ms=video.duration_ms,
@@ -827,12 +1068,12 @@ class Orchestrator:
         chapter_seconds: int = 300,
         max_chapters: int = 40,
         max_items: int = 8,
-        min_seconds: int = 600,
+        min_seconds: int = 300,
         summarize: bool = True,
     ) -> list[Any]:
         """把长视频按章节切开并逐章摘要，返回 :class:`Chapter` 列表。
 
-        短视频（短于 ``min_seconds``）返回**空列表** —— 一分钟能说清的内容拆成
+        短视频（短于 ``min_seconds``）返回**空列表** —— 半分钟就能读完的内容拆成
         三章只是让读者多点两次。调用方拿到空列表就继续走 :meth:`summarize`。
 
         每章独立调一次模型，所以长视频的耗时与章节数成正比；``summarize=False``
@@ -915,35 +1156,239 @@ class Orchestrator:
         *,
         chapter_seconds: int = 300,
         max_chapters: int = 40,
-        min_seconds: int = 600,
+        min_seconds: int = 300,
         total_summary: str = "",
     ) -> str:
-        """章节化 markdown 报告；短视频自动退回单段总结。"""
-        from core.pipeline.chapters import chapters_markdown  # noqa: PLC0415
+        """对外报告入口（CLI export / ``/chapters/report``）。
+
+        自 2026-10 起产出**三层报告**（综合总结 / 内容驱动脉络 / 修字解说词，
+        见 :meth:`full_report`）；旧的"逐章摘要拼接"格式仍可经
+        ``chapters_markdown`` 取到，但不再是默认导出。
+        """
+        return self.full_report(
+            video_id,
+            chapter_seconds=chapter_seconds,
+            max_chapters=max_chapters,
+            min_seconds=min_seconds,
+            total_summary=total_summary,
+        )
+
+    # ------------------------------------------------------------------ #
+    # 三层报告（改进 A/B）
+    # ------------------------------------------------------------------ #
+
+    def full_report(
+        self,
+        video_id: str,
+        *,
+        chapter_seconds: int = 300,
+        max_chapters: int = 40,
+        min_seconds: int = 300,
+        total_summary: str = "",
+    ) -> str:
+        """三层报告：综合总结 / 内容驱动的脉络 / 修字后的详细解说词。
+
+        改进 A：解说词是转写原文经 LLM **只修错字**（不增删不总结）的版本，
+        单独成节 —— 长视频的"几千字详细内容"由它承担，而不是靠总结注水。
+        改进 B：脉络不再按 30s 网格让模型逐格填空，而是逐章从素材里挑
+        真实节点（时间取自证据时间戳，禁止均匀切分），再合并成全片脉络。
+
+        每层都有降级：LLM 不可用 → 脉络取章摘要首句、解说词用原文、
+        综合用章节摘要拼接 —— 报告永远出得来，只是层数变薄。
+        """
+        from core.pipeline.chapters import Chapter, _first_clause  # noqa: PLC0415
         from core.pipeline.context_builder import format_hms  # noqa: PLC0415
+        from core.prompts import get_prompt_registry  # noqa: PLC0415
 
         video = self._repo.find_video(video_id)
         if video is None:
             raise PipelineError(f"视频不存在: {video_id}")
         title = video.title or video.display_name or video_id
+        duration_ms = video.duration_ms or 0
+        cfg_report = self._cfg.report
+        registry = get_prompt_registry()
+        llm = self._llm or _build_llm(self._cfg, None)
+
+        try:
+            segment_rows = self._repo.get_segments(video_id)
+        except Exception:  # noqa: BLE001
+            segment_rows = []
+
+        # 1) 章节骨架：长视频走既有逐章摘要；短视频合并为单章
         chapters = self.chapters(
-            video_id,
-            chapter_seconds=chapter_seconds,
-            max_chapters=max_chapters,
-            min_seconds=min_seconds,
+            video_id, chapter_seconds=chapter_seconds,
+            max_chapters=max_chapters, min_seconds=min_seconds,
         )
         if not chapters:
-            body = total_summary or self.summarize(video_id)
-            return (
-                f"# {title}\n\n时长 {format_hms(video.duration_ms)}\n\n"
-                f"## 总结\n\n{body.strip()}\n"
+            summary = total_summary or self.summarize(video_id)
+            chapters = [Chapter(index=1, start_ms=0, end_ms=duration_ms,
+                                summary=summary.strip())]
+
+        # 2) 逐章：内容驱动的里程碑 + 修字解说词
+        milestone_lines: list[str] = []
+        transcript_parts: list[str] = []
+        for chapter in chapters:
+            lo, hi = chapter.start_ms, max(chapter.end_ms, chapter.start_ms + 1)
+            seg_texts = [
+                (int(getattr(r, "start_ms", 0) or 0),
+                 str(getattr(r, "text", "") or "").strip())
+                for r in segment_rows
+                if lo <= int(getattr(r, "start_ms", 0) or 0) < hi
+                and str(getattr(r, "text", "") or "").strip()
+            ]
+            chapter_notes: list[str] = []
+
+            # 2a) 里程碑（改进 B）
+            if seg_texts:
+                context = "\n".join(
+                    f"{_ms_label(ms)} {text}" for ms, text in seg_texts[:400]
+                )[:6_000]
+            else:
+                context = f"（本章无语音，画面摘要）{chapter.summary}"
+            try:
+                prompt = registry.render(
+                    "chapter_milestones",
+                    title=title, start_time=_ms_label(lo), end_time=_ms_label(hi),
+                    max_items=int(cfg_report.milestones_max_per_chapter),
+                    context=context,
+                )
+                with self._inference_slot("章节脉络", None):
+                    response = llm.complete(
+                        [{"role": "user", "content": prompt}], temperature=0.2
+                    )
+                lines = _parse_milestones(
+                    str(response.text or ""), lo, hi,
+                )
+            except Exception as exc:  # noqa: BLE001 - 脉络失败降级为章摘要首句
+                logger.debug("第 %d 章里程碑失败: %s", chapter.index, exc)
+                lines = []
+            if not lines:
+                first_sentence = _first_clause(chapter.summary) or "本章内容"
+                lines = [(lo, first_sentence)]
+                chapter_notes.append("脉络降级：章摘要首句")
+            milestone_lines.extend(
+                # 脉络是秒级信息，毫秒尾数只是噪声
+                f"- **{_ms_label(ms)[:-4]}** {text}" for ms, text in lines
             )
-        return chapters_markdown(
-            title,
-            chapters,
-            total_summary=total_summary,
-            duration_ms=video.duration_ms,
-        )
+
+            # 2b) 修字解说词（改进 A）
+            header = f"### {_ms_label(lo)} – {_ms_label(hi)}"
+            if not seg_texts:
+                transcript_parts.append(f"{header}\n\n（本章无语音内容）")
+                continue
+            raw_text = "\n".join(text for _, text in seg_texts)
+            if not cfg_report.polish_transcript:
+                transcript_parts.append(f"{header}\n\n{raw_text}")
+                continue
+            polished = self._polish_transcript(llm, registry, raw_text, lo, hi,
+                                               notes=chapter_notes)
+            transcript_parts.append(f"{header}\n\n{polished or raw_text}")
+
+        # 3) 综合总结：各章摘要再综合（改进 A 第一层）
+        if total_summary.strip():
+            synthesis = total_summary.strip()
+        else:
+            digest = "\n\n".join(
+                f"[第 {c.index} 章 {_ms_label(c.start_ms)}–{_ms_label(c.end_ms)}] "
+                f"{(c.summary or '').strip()}"
+                for c in chapters
+            )
+            try:
+                prompt = registry.render(
+                    "report_synthesis", title=title,
+                    duration=format_hms(duration_ms) if duration_ms else "未知",
+                    context=digest[:12_000],
+                )
+                with self._inference_slot("综合总结", None):
+                    response = llm.complete(
+                        [{"role": "user", "content": prompt}], temperature=0.3
+                    )
+                synthesis = str(response.text or "").strip()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("综合总结生成失败，退回章节摘要拼接: %s", exc)
+                synthesis = digest
+            if not synthesis:
+                synthesis = digest
+        # 综合层自带 "## 内容概览/## 关键结论" 小节，降为三级避免与
+        # 报告的二级节标题（综合总结/主要脉络/详细解说词）平级。
+        synthesis = re.sub(r"^##\s+", "### ", synthesis, flags=re.M)
+
+        transcript_chars = sum(len(p) for p in transcript_parts)
+        lines = [
+            f"# {title}",
+            "",
+            f"时长 {format_hms(duration_ms) if duration_ms else '未知'} ｜ "
+            f"{len(chapters)} 章 ｜ 脉络 {len(milestone_lines)} 条 ｜ "
+            f"解说词 {transcript_chars} 字",
+            "",
+            "## 综合总结",
+            "",
+            synthesis,
+            "",
+            "## 主要脉络",
+            "",
+            *milestone_lines,
+            "",
+            "## 详细解说词",
+            "",
+            *transcript_parts,
+            "",
+        ]
+        return "\n".join(lines)
+
+    def _polish_transcript(
+        self,
+        llm: Any,
+        registry: Any,
+        raw_text: str,
+        lo: int,
+        hi: int,
+        *,
+        notes: list[str] | None = None,
+    ) -> str:
+        """修字（只改错字/标点，不改写）。超长按块切分，逐块调用后拼接。"""
+        cap = max(500, int(self._cfg.report.polish_block_chars))
+        blocks: list[str] = []
+        current: list[str] = []
+        used = 0
+        for line in raw_text.splitlines():
+            if used + len(line) > cap and current:
+                blocks.append("\n".join(current))
+                current, used = [], 0
+            current.append(line)
+            used += len(line) + 1
+        if current:
+            blocks.append("\n".join(current))
+
+        out: list[str] = []
+        total = len(blocks)
+        for i, block in enumerate(blocks, start=1):
+            span_lo = _ms_label(lo) if i == 1 else f"（续 {i}/{total}）"
+            span_hi = _ms_label(hi) if i == total else f"（待续 {i}/{total}）"
+            try:
+                prompt = registry.render(
+                    "transcript_polish", start_time=span_lo, end_time=span_hi,
+                    transcript=block,
+                )
+                with self._inference_slot("解说词修字", None):
+                    response = llm.complete(
+                        [{"role": "user", "content": prompt}], temperature=0.0
+                    )
+                text = str(response.text or "").strip()
+                # 修字层不许 LLM 偷懒总结：输出明显短于输入一半时视为违约，
+                # 该块退回原文（宁可保留错字，不能丢内容）。
+                if text and len(text) >= len(block) * 0.5:
+                    out.append(text)
+                else:
+                    out.append(block)
+                    if notes is not None:
+                        notes.append(f"解说词第 {i} 块修字输出过短，保留原文")
+            except Exception as exc:  # noqa: BLE001 - 修字失败退原文
+                logger.debug("解说词修字失败（块 %d/%d）: %s", i, total, exc)
+                out.append(block)
+                if notes is not None:
+                    notes.append(f"解说词第 {i} 块修字失败，保留原文")
+        return "\n\n".join(out)
 
     def delete(self, video_id: str) -> dict[str, Any]:
         """删视频及其向量与磁盘产物（``DELETE /videos/{id}`` 的后端）。"""
@@ -1206,12 +1651,82 @@ class Orchestrator:
     def _detect_scenes(self, local_path: Path, probe_info: Any) -> tuple[list[Any], str, list[str]]:
         if self._scene is None:
             return [], "none", ["场景检测不可用，切片将只依赖转录"]
+        detector = self._scene
+        warnings: list[str] = []
+        # D4/Tier2：长视频检测加速。优先 ffmpeg+NVDEC 硬解+降采样（快一个
+        # 量级）；不可用时退 pyscedetect 跳帧档。PySceneDetect 在 Python 里
+        # 逐帧算 HSV 差分，高运动长视频实测 6 分半要 10 分钟 —— 检测不该
+        # 比视频本身长。
         try:
-            scenes, detector, warnings = self._scene.detect_scenes(local_path, probe_info)
-            return list(scenes), str(detector), list(warnings)
+            duration_ms = int(getattr(probe_info, "duration_ms", 0) or 0)
+        except Exception:  # noqa: BLE001
+            duration_ms = 0
+        long_video = 0 < self._cfg.media.scene_detect.long_video_min_ms <= duration_ms
+        if long_video and detector is not None:
+            boosted = self._long_video_detector()
+            if boosted is not None:
+                detector = boosted
+                warnings.append(
+                    "长视频场景检测走 ffmpeg/NVDEC 硬解 + 480px 打分"
+                    "（切点精度略降，耗时大幅下降）"
+                )
+            else:
+                boost = self._scene_boost(duration_ms)
+                if boost is not None:
+                    try:
+                        detector = self._boosted_scene_detector(*boost)
+                        warnings.append(
+                            f"长视频场景检测加速（frame_skip={boost[0]}, downscale={boost[1]}）："
+                            f"切点精度略降，检测耗时大幅下降"
+                        )
+                    except Exception as exc:  # noqa: BLE001 - 加速失败退回原配置
+                        logger.debug("构造加速检测器失败，退回默认: %s", exc)
+                        detector = self._scene
+        try:
+            scenes, det, warns = detector.detect_scenes(local_path, probe_info)
+            return list(scenes), str(det), list(warns) + warnings
         except Exception as exc:  # noqa: BLE001
             logger.warning("场景检测失败: %s", exc)
             return [], "none", [f"场景检测失败: {exc}"]
+
+    def _scene_boost(self, duration_ms: int) -> tuple[int, int] | None:
+        """长视频的 pyscedetect 加速档（frame_skip/downscale）。
+
+        注意 downscale 不是 SceneSection 的配置项（检测器默认 2），
+        这里以"不小于默认值"为下限取 long_video_downscale。
+        """
+        sec = self._cfg.media.scene_detect
+        if sec.long_video_min_ms <= 0 or duration_ms < sec.long_video_min_ms:
+            return None
+        if sec.detector not in {"content", "adaptive", "hash"}:
+            return None  # ffmpeg/fixed 档本来就不慢
+        return (
+            max(int(sec.frame_skip or 0), int(sec.long_video_frame_skip)),
+            max(2, int(sec.long_video_downscale)),
+        )
+
+    def _boosted_scene_detector(self, frame_skip: int, downscale: int) -> Any:
+        return self._scene_detector_with(frame_skip=frame_skip, downscale=downscale)
+
+    def _long_video_detector(self) -> Any | None:
+        """长视频专用检测器（Tier 2）：ffmpeg + NVDEC 硬解 + 480px 打分。
+
+        PySceneDetect 是 Python 逐帧软解，高运动长视频实测比视频本身还长；
+        ffmpeg 档走解码器硬解 + 缩小画面后再打分，快一个量级。构造失败
+        （配置/参数问题）返回 None，调用方退回 pyscedetect 加速档。
+        """
+        sec = self._cfg.media.scene_detect
+        if not sec.long_video_use_ffmpeg:
+            return None
+        try:
+            return self._scene_detector_with(
+                detector="ffmpeg",
+                ffmpeg_hwaccel=bool(sec.long_video_hwaccel),
+                ffmpeg_detect_width=int(sec.long_video_detect_width),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("构造 ffmpeg 硬解检测器失败: %s", exc)
+            return None
 
     def _chunk(self, video_id: str, segments: list[Any], duration_ms: int) -> list[Any]:
         if self._chunker is None:
@@ -1235,6 +1750,8 @@ class Orchestrator:
         clips: list[Any],
         opts: AnalyzeOptions,
         report: AnalysisReport,
+        *,
+        high_motion: bool = False,
     ) -> list[Any]:
         if self._scene is None or opts.skip_vision:
             return []
@@ -1242,12 +1759,30 @@ class Orchestrator:
         out_dir.mkdir(parents=True, exist_ok=True)
         clip_bounds = [(c.clip_id, c.core_start_ms, c.core_end_ms) for c in clips]
         resolver = _clip_resolver(clip_bounds)
+
+        # D3 高运动降档：场景密度高的视频（体育/比赛），把相邻场景合并到
+        # >= high_motion_scene_span_ms 再抽帧、每场景只留 1 帧 —— 静帧本来就
+        # 区分不出两次进攻，多抽只是烧钱烧时间。
+        detector = self._scene
+        eff_scenes = scenes
+        if high_motion and scenes:
+            span_ms = int(self._cfg.vl.high_motion_scene_span_ms)
+            eff_scenes = _merge_scenes(scenes, span_ms)
+            try:
+                detector = self._scene_detector_with(frames_per_scene=1, min_frames_per_scene=1)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("构造降档检测器失败，沿用原配置: %s", exc)
+            report.warnings.append(
+                f"高运动视频视觉降档：{len(scenes)} 场景合并为 {len(eff_scenes)} 窗"
+                f"（≥{span_ms // 1000}s/窗，每窗 1 帧）"
+            )
+
         try:
-            extraction = self._scene.extract_keyframes(
+            extraction = detector.extract_keyframes(
                 local_path,
                 video_id,
                 out_dir,
-                scenes=scenes or None,
+                scenes=eff_scenes or None,
                 clip_resolver=resolver,
             )
         except Exception as exc:  # noqa: BLE001
@@ -1262,11 +1797,12 @@ class Orchestrator:
         if getattr(extraction, "degraded", False):
             report.degraded.append("关键帧抽取降级（部分帧质量不达标）")
 
-        # 视觉理解
+        # 视觉理解（描述）：segments / frames 按 vl.video_mode 与高运动画像分派
         payloads: list[dict[str, Any]] = []
         if self._vl is not None and not opts.skip_vision:
-            with self._inference_slot("画面理解", report):
-                payloads = self._describe_keyframes(keyframes, report)
+            payloads = self._describe_visual(
+                local_path, keyframes, report, eff_scenes, high_motion
+            )
         else:
             payloads = [_keyframe_payload(kf, "", "") for kf in keyframes]
         if payloads:
@@ -1283,10 +1819,150 @@ class Orchestrator:
                 logger.debug("清理旧关键帧记录失败", exc_info=True)
         return keyframes
 
-    def _describe_keyframes(
-        self, keyframes: list[Any], report: AnalysisReport
+    def _scene_detector_with(self, **overrides: Any) -> Any:
+        """按当前配置构造场景检测器，允许临时覆盖若干参数（D3 降档用）。"""
+        from core.media.scene_detect import SceneDetectConfig, SceneDetector  # noqa: PLC0415
+
+        payload = self._cfg.media.scene_detect.flattened()
+        payload.update({k: v for k, v in overrides.items()})
+        known = set(SceneDetectConfig.__dataclass_fields__)
+        return SceneDetector(
+            SceneDetectConfig(**{k: v for k, v in payload.items() if k in known})
+        )
+
+    def _describe_visual(
+        self,
+        local_path: Path,
+        keyframes: list[Any],
+        report: AnalysisReport,
+        scenes: list[Any],
+        high_motion: bool,
     ) -> list[dict[str, Any]]:
-        """关键帧 → 画面描述。连续模式下按场景分组，一次推理出一段叙述。"""
+        """视觉描述总分派：视频段（云端）/ 抽帧（本地或云端）按配置与画像选路。"""
+        vl = self._vl
+        if vl is None or not keyframes:
+            return [_keyframe_payload(kf, "", "") for kf in keyframes]
+        mode = str(getattr(self._cfg.vl, "video_mode", "auto") or "auto")
+        supports_seg = bool(getattr(vl, "supports_video_segments", False))
+        want_segments = mode == "segments" or (mode == "auto" and high_motion)
+        if want_segments and supports_seg and local_path and Path(local_path).is_file():
+            self._last_vision_mode = "segments"
+            payloads = self._describe_by_segments(vl, Path(local_path), keyframes, report, scenes)
+            if payloads:
+                return payloads
+            # 整条段通道没产出（全部失败）→ 落回抽帧，不能让视觉整体缺失
+            self._last_vision_mode = "segments→frames"
+        self._last_vision_mode = "frames" + ("-downgraded" if high_motion else "")
+        cloud = bool(getattr(vl, "is_cloud", False))
+        if cloud:
+            # D5：云端是网络型调用，不吃本地显存，无需推理锁，且可并发。
+            return self._describe_keyframes(keyframes, report, parallel=True)
+        with self._inference_slot("画面理解", report):
+            return self._describe_keyframes(keyframes, report)
+
+    def _describe_by_segments(
+        self,
+        vl: Any,
+        video_path: Path,
+        keyframes: list[Any],
+        report: AnalysisReport,
+        scenes: list[Any],
+    ) -> list[dict[str, Any]]:
+        """P1 视频段理解：场景聚成 ≤ video_segment_max_s 的时间窗，整段发云端。
+
+        每窗产出一段含运动语义的描述（顺带读出画面烧录字幕），写进该窗全部
+        关键帧；单窗失败退回该窗抽帧描述；段数受 ``video_segment_budget``
+        约束（费用闸门），超出部分直接走抽帧。
+        """
+        from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+        cfg_vl = self._cfg.vl
+        chunks = _segment_chunks(scenes or [], int(cfg_vl.video_segment_max_s))
+        if not chunks:
+            return []
+        budget = max(1, int(cfg_vl.video_segment_budget))
+        seg_chunks, rest_chunks = chunks[:budget], chunks[budget:]
+        if rest_chunks:
+            report.warnings.append(
+                f"视频段预算 {budget} 用满，其余 {len(rest_chunks)} 窗走抽帧描述"
+            )
+        by_scene: dict[int, list[Any]] = {}
+        for kf in keyframes:
+            by_scene.setdefault(int(getattr(kf, "scene_index", 0)), []).append(kf)
+
+        payloads_by_id: dict[str, dict[str, Any]] = {}
+        ok = degraded = 0
+        errors: dict[str, int] = {}
+
+        def run_segment(chunk: list[int]) -> tuple[list[int], Any]:
+            start = int(scenes[chunk[0]].start_ms)
+            end = int(scenes[chunk[-1]].end_ms)
+            return chunk, vl.describe_video_segment(video_path, start, end)
+
+        workers = max(1, min(4, len(seg_chunks)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="vl-seg") as pool:
+            for chunk, result in pool.map(run_segment, seg_chunks):
+                frames = [kf for idx in chunk for kf in by_scene.get(idx, [])]
+                if result is None or getattr(result, "degraded", False):
+                    degraded += 1
+                    reason = str(getattr(result, "error", "") or "未知原因")
+                    errors[reason] = errors.get(reason, 0) + 1
+                    for payload in self._describe_frames_subset(vl, frames):
+                        payloads_by_id[payload["keyframe_id"]] = payload
+                else:
+                    ok += 1
+                    for kf in frames:
+                        payloads_by_id[kf.keyframe_id] = _keyframe_payload(
+                            kf, result.description, result.ocr_text
+                        )
+
+        # 预算外的窗：走抽帧描述（云端并发 / 本地串行）
+        rest_scene_ids = {idx for chunk in rest_chunks for idx in chunk}
+        rest_frames = [kf for kf in keyframes
+                       if int(getattr(kf, "scene_index", 0)) in rest_scene_ids]
+        if rest_frames:
+            for payload in self._describe_keyframes(rest_frames, report,
+                                                    parallel=bool(getattr(vl, "is_cloud", False))):
+                payloads_by_id[payload["keyframe_id"]] = payload
+
+        if ok or degraded:
+            report.warnings.append(
+                f"视频段理解: {ok} 窗成功、{degraded} 窗回退抽帧（≤{cfg_vl.video_segment_max_s}s/窗）"
+            )
+        for reason, count in errors.items():
+            report.degraded.append(
+                f"视频段理解降级 {count} 窗: {reason[:120]}"
+            )
+        return [payloads_by_id.get(kf.keyframe_id, _keyframe_payload(kf, "", ""))
+                for kf in keyframes]
+
+    def _describe_frames_subset(
+        self, vl: Any, frames: list[Any]
+    ) -> list[dict[str, Any]]:
+        """一小段关键帧的抽帧描述（段通道单窗失败时的回退）。"""
+        if not frames:
+            return []
+        describe_sequence = getattr(vl, "describe_sequence", None)
+        if bool(self._cfg.vl.sequence_mode) and callable(describe_sequence) and len(frames) > 1:
+            span = (_kf_ms(frames[0]), _kf_ms(frames[-1]))
+            result = describe_sequence(
+                [(kf.path, _kf_ms(kf)) for kf in frames], span_ms=span
+            )
+            return [_keyframe_payload(kf, result.description, result.ocr_text) for kf in frames]
+        out = []
+        for kf in frames:
+            result = vl.describe(kf.path)
+            out.append(_keyframe_payload(kf, result.description, result.ocr_text))
+        return out
+
+    def _describe_keyframes(
+        self, keyframes: list[Any], report: AnalysisReport, *, parallel: bool = False
+    ) -> list[dict[str, Any]]:
+        """关键帧 → 画面描述。连续模式下按场景分组，一次推理出一段叙述。
+
+        ``parallel=True`` 仅用于云端后端（网络型，不吃本地显存）；
+        本地 GGUF 始终串行并受推理锁保护。
+        """
         vl = self._vl
         if vl is None:
             return [_keyframe_payload(kf, "", "") for kf in keyframes]
@@ -1295,15 +1971,28 @@ class Orchestrator:
         # 用户读到的是一屏废话。这里按原因归并，最后每个原因只报一次并带上帧数。
         vision_errors: dict[str, int] = {}
         describe_sequence = getattr(vl, "describe_sequence", None)
-        if bool(self._cfg.vl.sequence_mode) and callable(describe_sequence):
-            # 连续理解：一个场景一次多帧推理，产出一段叙述，组内每帧共用这段叙述。
-            # 逐帧独立描述时模型看不到前后帧，会写出"接着画面似乎发生了变化"
-            # 这类凭空推断 —— 这正是用户说的"不连贯"。
-            for group in _group_by_scene(keyframes, self._cfg.vl.sequence_frames):
+        sequence_ok = bool(self._cfg.vl.sequence_mode) and callable(describe_sequence)
+
+        if sequence_ok:
+            groups = _group_by_scene(keyframes, self._cfg.vl.sequence_frames)
+
+            def work(group: list[Any]) -> tuple[Any, list[Any]]:
                 span = (_kf_ms(group[0]), _kf_ms(group[-1]))
-                result = describe_sequence(
+                return describe_sequence(
                     [(kf.path, _kf_ms(kf)) for kf in group], span_ms=span
-                )
+                ), group
+
+            if parallel and len(groups) > 1:
+                from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+                with ThreadPoolExecutor(
+                    max_workers=min(4, len(groups)), thread_name_prefix="vl-cloud"
+                ) as pool:
+                    results = list(pool.map(work, groups))
+            else:
+                results = [work(g) for g in groups]
+            for result, group in results:
+                span = (_kf_ms(group[0]), _kf_ms(group[-1]))
                 if result.degraded:
                     reason = (str(result.error or "未知原因")).strip()
                     vision_errors[reason] = vision_errors.get(reason, 0) + len(group)
@@ -1464,10 +2153,12 @@ class Orchestrator:
             return "", "skipped"
         payloads = list(self._repo.iter_clip_payloads(video_id))
         payloads = self._attach_visuals(video_id, payloads)
-        builder = self._ctx or _build_context(self._cfg)
-        built = builder.build_summary(
-            payloads, video_title=title, duration_ms=duration_ms
-        )
+        from core.pipeline.context_builder import ContextBuilder  # noqa: PLC0415
+        from core.prompts import get_prompt_registry  # noqa: PLC0415
+
+        built = ContextBuilder(
+            _summary_budget(len(payloads)), prompts=get_prompt_registry()
+        ).build_summary(payloads, video_title=title, duration_ms=duration_ms)
         if not built.ok:
             return "", "none"
         llm = self._llm or _build_llm(self._cfg, None)
@@ -1501,6 +2192,13 @@ class Orchestrator:
             return items
 
         out: list[Any] = []
+        # D2 跨片段折叠：运动类视频每段画面的描述几乎全同（"球员奔跑传球"），
+        # 14 段同质证据进总结就是 8 遍复读 + 逼模型在结尾幻觉差异。
+        # 首次出现的描述保留全文，相似（bigram-Dice ≥ 0.75）的后续片段折叠成
+        # "画面与前段类似"，时间跨度保留 —— 覆盖率不丢，重复信息只算一次。
+        from core.pipeline.claims import dice  # noqa: PLC0415
+
+        seen_descs: list[str] = []
         for item in items:
             notes: list[str] = []
             # 一段连续画面会被写进同一组内的每一帧（同一段叙述 + 不同时间戳），
@@ -1519,15 +2217,28 @@ class Orchestrator:
                     continue
                 ms = int(getattr(kf, "timestamp_ms", 0) or 0)
                 grouped.setdefault(desc, []).append(ms)
-            for desc, stamps in sorted(grouped.items(), key=lambda kv: min(kv[1])):
-                lo, hi = min(stamps), max(stamps)
-                span = (
-                    f"{_ms_label(lo)}–{_ms_label(hi)}" if hi - lo > 500 else _ms_label(lo)
-                )
-                notes.append(f"【画面 {span}】{desc[:240]}")
-            if not notes:
+            if not grouped:
                 out.append(item)
                 continue
+            joined = " ".join(
+                d for d, _ in sorted(grouped.items(), key=lambda kv: min(kv[1]))
+            )
+            similar = next((s for s in seen_descs if dice(s, joined) >= 0.75), None)
+            if similar is None:
+                seen_descs.append(joined)
+                for desc, stamps in sorted(grouped.items(), key=lambda kv: min(kv[1])):
+                    lo, hi = min(stamps), max(stamps)
+                    span = (
+                        f"{_ms_label(lo)}–{_ms_label(hi)}" if hi - lo > 500 else _ms_label(lo)
+                    )
+                    notes.append(f"【画面 {span}】{desc[:240]}")
+            else:
+                stamps_all = [ms for sts in grouped.values() for ms in sts]
+                lo, hi = min(stamps_all), max(stamps_all)
+                notes.append(
+                    f"【画面 {_ms_label(lo)}–{_ms_label(hi)}】"
+                    f"（画面与前段类似，此处不重复展开）"
+                )
             extra = "\n".join(notes)
             base = _item_text(item).strip()
             out.append(_item_with_text(item, f"{base}\n{extra}" if base else extra))
@@ -1862,6 +2573,25 @@ _STAGE_LABEL: Final[dict[Stage, str]] = {
 }
 
 
+def _summary_budget(clip_count: int) -> Any:
+    """总结用的专用证据预算（与问答的 top_k+2 上限解耦）。
+
+    问答要"挑最相关的"，总结要"覆盖全片"。早期共用 8 条预算，16 片的视频
+    有一半内容模型根本没看到 —— 5 分钟的讲话被压成三句话不是模型的错。
+    全量片段上限 32：再长的视频靠"按位置铺开"保证首尾，超出预算的部分
+    仍由 build_summary 的 spread_order 挑代表。
+    """
+    from core.pipeline.context_builder import ContextBudget  # noqa: PLC0415
+
+    count = max(0, int(clip_count or 0))
+    return ContextBudget(
+        max_tokens=8_000,
+        max_chars=max(12_000, 700 * max(1, count)),
+        max_items=max(12, min(32, count or 12)),
+        max_chars_per_item=1_200,
+    )
+
+
 def _download_progress(
     progress: Callable[[str, float, str], None] | None,
 ) -> Callable[[Any], None] | None:
@@ -2073,9 +2803,113 @@ def _kf_scene(keyframe: Any) -> int:
         return 0
 
 
+_MILESTONE_RE = re.compile(
+    r"^\s*[-*•·]*\s*(?:\d+[.、)）]\s*)?"
+    r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*[,，、)）]?\s*[—\-：:]?\s*(\S.*)$"
+)
+
+
+def _parse_milestones(
+    text: str, window_start_ms: int, window_end_ms: int
+) -> list[tuple[int, str]]:
+    """解析 LLM 的里程碑行 ``HH:MM:SS 说明``，只收窗口内的时间。
+
+    时间落在章节窗口 ±60s 之外的行直接丢弃 —— 模型偶尔会抄示例里的
+    "00:00:00" 或编一个超界时间，宁缺毋滥。两段式时间（MM:SS）也接受。
+    """
+    out: list[tuple[int, str]] = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("格式"):
+            continue
+        match = _MILESTONE_RE.match(line)
+        if not match:
+            continue
+        h, m, s, rest = match.groups()
+        try:
+            hh = int(h)
+            mm = int(m)
+            ss = int(s or 0)
+        except ValueError:
+            continue
+        # 两种格式：HH:MM:SS（三段）或 M:SS（两段，"时"位其实是分）
+        if s is None:
+            total_ms = hh * 60_000 + mm * 1_000
+        else:
+            total_ms = ((hh * 60 + mm) * 60 + ss) * 1000
+        if not (window_start_ms - 60_000 <= total_ms <= window_end_ms + 60_000):
+            continue
+        note = rest.strip().strip("。；;")[:60]
+        if note:
+            out.append((total_ms, note))
+    out.sort(key=lambda item: item[0])
+    return out
+
+
+def _merge_scenes(scenes: Sequence[Any], span_ms: int) -> list[Any]:
+    """D3：把相邻场景合并到 ``>= span_ms`` 的窗口（高运动降档用）。
+
+    返回带 index/start_ms/end_ms/duration_ms/midpoint_ms 的轻量对象，
+    满足 :meth:`SceneDetector.extract_keyframes` 对 scenes 的全部取用。
+    """
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    merged: list[list[int]] = []
+    cur: list[int] | None = None
+    for scene in scenes:
+        start = int(getattr(scene, "start_ms", 0) or 0)
+        end = int(getattr(scene, "end_ms", 0) or 0)
+        if cur is None:
+            cur = [start, end]
+        else:
+            cur[1] = max(cur[1], end)
+        if cur[1] - cur[0] >= span_ms:
+            merged.append(cur)
+            cur = None
+    if cur:
+        merged.append(cur)
+
+    out: list[Any] = []
+    total_end = max((int(getattr(s, "end_ms", 0) or 0) for s in scenes), default=0)
+    for i, (start, end) in enumerate(merged):
+        out.append(SimpleNamespace(
+            index=i, start_ms=start, end_ms=end,
+            duration_ms=end - start, midpoint_ms=(start + end) // 2,
+            detector="merged",
+        ))
+    if out and total_end and out[-1].end_ms < total_end:
+        out[-1].end_ms = total_end
+        out[-1].duration_ms = total_end - out[-1].start_ms
+    return out
+
+
+def _segment_chunks(scenes: Sequence[Any], max_s: int) -> list[list[int]]:
+    """P1：把连续场景聚成 ``<= max_s`` 秒的时间窗，返回场景下标分组。
+
+    供视频段理解使用 —— 段长决定上传体积与模型可看的运动时长，
+    超过 API 限制的段会被服务端拒绝，这里在源头剪好。
+    """
+    limit_ms = max(1, int(max_s)) * 1000
+    chunks: list[list[int]] = []
+    cur: list[int] = []
+    cur_start = 0
+    for i, scene in enumerate(scenes):
+        start = int(getattr(scene, "start_ms", 0) or 0)
+        end = int(getattr(scene, "end_ms", 0) or 0)
+        if cur and end - cur_start > limit_ms:
+            chunks.append(cur)
+            cur = []
+            cur_start = start
+        if not cur:
+            cur_start = start
+        cur.append(i)
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 def _group_by_scene(keyframes: Sequence[Any], limit: int) -> list[list[Any]]:
     """按场景切分关键帧，每组最多 ``limit`` 帧（首尾优先）。
-
     做法：场景是天然的"镜头边界"，一个场景内抽的 2 帧讲的是同一件事，
     放进一次推理模型能看出"这段时间画面怎么变"。跨场景硬凑在一起反而
     会让它把两个场景讲成一个。
@@ -2346,6 +3180,7 @@ def _build_llm(cfg: AppConfig, manager: Any) -> Any:
 
 def _build_context(cfg: AppConfig) -> Any:
     from core.pipeline.context_builder import ContextBudget, ContextBuilder  # noqa: PLC0415
+    from core.prompts import get_prompt_registry  # noqa: PLC0415
 
     budget = ContextBudget(
         max_tokens=cfg.retrieval.context_max_tokens
@@ -2354,11 +3189,14 @@ def _build_context(cfg: AppConfig) -> Any:
         max_chars=cfg.retrieval.max_clip_chars * 6,
         max_items=cfg.retrieval.top_k + 2,
     )
+    # 必须挂上提示词注册表：不挂的话 build_summary/qa_answer 全走内置兜底
+    # 文案，configs/prompts.yaml 里精修的模板（含防注入声明）形同虚设 ——
+    # 这正是"总结又短又干"的隐藏原因之一。
     try:
-        return ContextBuilder(budget)
+        return ContextBuilder(budget, prompts=get_prompt_registry())
     except Exception:  # noqa: BLE001 - 预算非法时退回默认
-        logger.debug("ContextBudget 构造失败，退回默认预算", exc_info=True)
-        return ContextBuilder(None)
+        logger.debug("ContextBuilder 构造失败，退回默认预算", exc_info=True)
+        return ContextBuilder(None, prompts=get_prompt_registry())
 
 
 def _build_downloader(cfg: AppConfig) -> Any:

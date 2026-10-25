@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>知影 · 视频对话</title>
+<style>
+:root{
+  --bg:#0f1115; --panel:#171a21; --panel2:#1d2330; --border:#262b36; --border2:#2e3542;
+  --text:#e6e8ee; --muted:#98a2b3; --accent:#4f7cff; --accent2:#7aa2ff;
+  --user-bg:#1e3a6e; --asst-bg:#1b202a; --ok:#3fbf7f; --warn:#e8c97a;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
+  font:14px/1.65 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+#app{display:flex;height:100vh}
+
+/* ---------- 左栏 ---------- */
+#side{width:300px;min-width:240px;border-right:1px solid var(--border);
+  background:var(--panel);display:flex;flex-direction:column}
+#side header{padding:14px 16px 10px;border-bottom:1px solid var(--border)}
+#side h1{margin:0;font-size:16px;font-weight:600}
+#side h1 a{color:var(--text);text-decoration:none}
+#side .sub{margin:2px 0 0;color:var(--muted);font-size:12px}
+#vlist{flex:1;overflow-y:auto;padding:8px}
+.vitem{padding:10px 12px;border-radius:10px;cursor:pointer;border:1px solid transparent;margin-bottom:6px}
+.vitem:hover{background:var(--panel2)}
+.vitem.on{background:var(--panel2);border-color:var(--border2)}
+.vitem .t{font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.vitem .m{color:var(--muted);font-size:12px;margin-top:2px}
+.vitem .st{display:inline-block;padding:0 7px;border-radius:99px;font-size:11px;margin-right:6px}
+.st.ready{background:#12351f;color:var(--ok)}
+.st.other{background:#33270f;color:var(--warn)}
+
+/* ---------- 主区 ---------- */
+#main{flex:1;display:flex;flex-direction:column;min-width:0}
+#stage{background:#000;border-bottom:1px solid var(--border);position:relative}
+#player{width:100%;max-height:42vh;display:block;background:#000;margin:0 auto}
+#playerbar{position:absolute;left:0;right:0;bottom:0;padding:6px 14px;
+  background:linear-gradient(transparent,rgba(0,0,0,.72));color:#fff;
+  font-size:12px;display:flex;justify-content:space-between}
+#nowplaying{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* 对话流 */
+#flow{flex:1;overflow-y:auto;padding:18px 10%;scroll-behavior:smooth}
+@media (max-width:900px){#flow{padding:14px}}
+.bubble{max-width:780px;margin:0 auto 14px;display:flex;gap:10px}
+.bubble .av{width:30px;height:30px;border-radius:8px;flex:none;display:flex;
+  align-items:center;justify-content:center;font-size:13px;margin-top:2px}
+.bubble.user{flex-direction:row-reverse}
+.bubble.user .av{background:var(--user-bg)}
+.bubble.asst .av{background:var(--asst-bg);border:1px solid var(--border2);color:var(--accent2)}
+.bubble .body{min-width:0;max-width:100%}
+.bubble.user .msg{background:var(--user-bg);padding:9px 14px;border-radius:12px 2px 12px 12px}
+.bubble.asst .msg{background:var(--asst-bg);border:1px solid var(--border);
+  padding:10px 14px;border-radius:2px 12px 12px 12px;white-space:pre-wrap;word-break:break-word}
+.bubble .meta{color:var(--muted);font-size:11px;margin-top:4px}
+.bubble.user .meta{text-align:right}
+.typing::after{content:"▍";color:var(--accent2);animation:blink 1s steps(2) infinite}
+@keyframes blink{50%{opacity:0}}
+
+/* 引用 chip 与证据卡 */
+.cite{display:inline-block;padding:0 7px;margin:0 2px;border-radius:99px;cursor:pointer;
+  background:#12233f;color:var(--accent2);border:1px solid #24406e;font-size:12px;line-height:1.7}
+.cite:hover{background:#1a3ecc33}
+.evcards{margin-top:8px;display:none}
+.evcards.open{display:block}
+.evcard{border:1px solid var(--border2);border-radius:10px;padding:9px 12px;margin-top:6px;
+  background:#141924;font-size:13px}
+.evcard .row{display:flex;gap:10px;align-items:flex-start}
+.evcard img{width:104px;border-radius:6px;flex:none;border:1px solid var(--border)}
+.evcard .time{color:var(--accent2);cursor:pointer;text-decoration:underline dotted}
+.evcard .time:hover{color:#fff}
+.evcard .src{color:var(--muted);font-size:11px;margin-top:4px}
+.notes{color:var(--muted);font-size:11px;margin-top:6px}
+
+/* 输入区 */
+#inputbar{border-top:1px solid var(--border);background:var(--panel);padding:12px 10%}
+#inputrow{display:flex;gap:10px;align-items:flex-end;max-width:780px;margin:0 auto}
+#q{flex:1;background:var(--panel2);border:1px solid var(--border2);color:var(--text);
+  border-radius:12px;padding:10px 14px;resize:none;font:inherit;max-height:140px;outline:none}
+#q:focus{border-color:var(--accent)}
+#send{background:var(--accent);border:0;color:#fff;border-radius:12px;padding:10px 20px;
+  cursor:pointer;font:inherit;font-weight:600}
+#send:disabled{opacity:.45;cursor:default}
+#stop{display:none;background:transparent;border:1px solid var(--border2);color:var(--warn);
+  border-radius:12px;padding:10px 14px;cursor:pointer;font:inherit}
+#hint{max-width:780px;margin:8px auto 0;color:var(--muted);font-size:11px;
+  display:flex;justify-content:space-between}
+#hint a{color:var(--muted);cursor:pointer}
+.empty{color:var(--muted);text-align:center;margin-top:12vh;font-size:13px}
+.empty code{background:var(--panel2);padding:2px 8px;border-radius:6px}
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <header>
+      <h1><a href="/chat">知影 · 视频对话</a></h1>
+      <p class="sub">选中视频即可对内容追问</p>
+      <p class="sub" style="margin-top:4px;display:flex;gap:10px">
+        <a id="newSession" style="color:var(--accent);cursor:pointer">＋新会话</a>
+        <a id="exportChat" style="color:var(--accent);cursor:pointer">导出 Markdown</a>
+        <a id="clearChat" style="color:var(--muted);cursor:pointer">清空对话</a>
+      </p>
+    </header>
+    <div id="vlist"><div class="empty">加载中…</div></div>
+    <div id="sessWrap" style="border-top:1px solid var(--border);padding:8px 0;display:none">
+      <div style="padding:4px 16px;color:var(--muted);font-size:11px;font-weight:600">历史会话</div>
+      <div id="sessList"></div>
+    </div>
+  </aside>
+
+  <main id="main">
+    <div id="stage">
+      <video id="player" controls preload="metadata"></video>
+      <div id="playerbar"><span id="nowplaying">未选择视频</span><span id="clock"></span></div>
+    </div>
+    <div id="flow"><div class="empty" id="placeholder">从左侧选择一个视频开始提问<br>
+      <span style="font-size:12px">回答带 <code>[n]</code> 引用，点击可跳转到对应画面</span></div></div>
+    <div id="inputbar">
+      <div id="inputrow">
+        <textarea id="q" rows="1" placeholder="对视频内容提问，Enter 发送（Shift+Enter 换行）"></textarea>
+        <button id="send">发送</button>
+        <button id="stop">停止</button>
+      </div>
+      <div id="hint"><span id="multiturn">多轮上下文：开</span><span>回答由本地/云端模型生成 · 引用可核对</span></div>
+    </div>
+  </main>
+</div>
+
+<script>
+"use strict";
+const $=s=>document.querySelector(s);
+const player=$("#player"),flow=$("#flow"),q=$("#q"),send=$("#send"),stopBtn=$("#stop");
+let currentVideo=null, currentTitle="", refsMap={}, ctrl=null, busy=false;
+let sessionId=(crypto.randomUUID ? crypto.randomUUID().slice(0,8) : Date.now().toString(36));
+const TOKEN=(new URLSearchParams(location.search)).get("token")||"";
+const H=()=>TOKEN?{"X-API-Token":TOKEN}:{};
+const esc=t=>(t||"").replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const hms=ms=>{const s=Math.max(0,Math.floor(ms/1000)),h=~~(s/3600),m=~~(s%3600/60),x=s%60;
+  return [h,m,x].map(v=>String(v).padStart(2,"0")).join(":")+"."+String(ms%1000).padStart(3,"0")};
+
+/* ---------- 视频列表 ---------- */
+async function loadVideos(){
+  const r=await fetch("/api/videos?limit=100",{headers:H()});
+  const items=await r.json();
+  const box=$("#vlist"); box.innerHTML="";
+  if(!items.length){box.innerHTML='<div class="empty">还没有视频<br><span style="font-size:12px">先在「分析」页签入库一个</span></div>';return}
+  for(const v of items){
+    const d=document.createElement("div");
+    d.className="vitem"; d.dataset.id=v.video_id;
+    const ready=v.status==="ready";
+    d.innerHTML=`<div class="t">${esc(v.title||v.display_name||v.video_id)}</div>
+      <div class="m"><span class="st ${ready?"ready":"other"}">${esc(v.status)}</span>
+      ${hms(v.duration_ms).slice(0,8)}</div>`;
+    d.onclick=()=>selectVideo(v);
+    box.appendChild(d);
+  }
+}
+
+/* ---------- 选片 ---------- */
+async function selectVideo(v){
+  currentVideo=v.video_id; currentTitle=v.title||v.display_name||v.video_id;
+  document.querySelectorAll(".vitem").forEach(e=>e.classList.toggle("on",e.dataset.id===v.video_id));
+  player.src=`/api/videos/${v.video_id}/file${TOKEN?"?token="+TOKEN:""}`;
+  $("#nowplaying").textContent=currentTitle;
+  $("#sessWrap").style.display="block";
+  flow.innerHTML="";
+  await loadSessions();
+  // 恢复最近一次会话的持久化对话
+  const sess=await (await fetch(`/api/videos/${v.video_id}/chat/sessions`,{headers:H()})).json();
+  const last=(sess.sessions||[])[0];
+  const sid=last&&last.session_id!=="legacy"?last.session_id:null;
+  const r=await fetch(`/api/videos/${v.video_id}/chat${sid?"?session_id="+sid:""}`,{headers:H()});
+  const data=await r.json();
+  $("#placeholder")?.remove?.();
+  if(!data.turns||!data.turns.length){addPlaceholder()}
+  for(const t of (data.turns||[])){
+    addUserBubble(t.question,false);
+    await addAssistantBubble(Promise.resolve({text:t.answer,refs:t.refs||[],notes:[]}),t.elapsed_ms,false);
+  }
+  if(last)sessionId=last.session_id==="legacy"?sessionId:last.session_id;
+  flow.scrollTop=flow.scrollHeight;
+  q.focus();
+}
+
+/* ---------- 历史会话列表 ---------- */
+async function loadSessions(){
+  if(!currentVideo)return;
+  const box=$("#sessList"); box.innerHTML="";
+  const data=await (await fetch(`/api/videos/${currentVideo}/chat/sessions`,{headers:H()})).json();
+  const list=data.sessions||[];
+  if(!list.length){box.innerHTML='<div class="muted" style="font-size:12px;padding:4px 12px">暂无历史会话</div>';return}
+  for(const s of list){
+    const d=document.createElement("div");
+    d.className="sitem";
+    const when=new Date(s.last_ts*1000);
+    d.innerHTML=`<span class="t">${s.session_id==="legacy"?"早期问答":s.session_id.slice(0,8)}</span>
+      <span class="m">${s.turns} 轮 · ${when.getMonth()+1}/${when.getDate()} ${String(when.getHours()).padStart(2,"0")}:${String(when.getMinutes()).padStart(2,"0")}</span>`;
+    d.onclick=()=>loadSessionTurns(s.session_id==="legacy"?null:s.session_id);
+    box.appendChild(d);
+  }
+}
+async function loadSessionTurns(sid){
+  const r=await fetch(`/api/videos/${currentVideo}/chat${sid?"?session_id="+sid:""}`,{headers:H()});
+  const data=await r.json();
+  flow.innerHTML="";
+  $("#placeholder")?.remove?.();
+  if(!data.turns||!data.turns.length){addPlaceholder();return}
+  for(const t of data.turns){
+    addUserBubble(t.question,false);
+    await addAssistantBubble(Promise.resolve({text:t.answer,refs:t.refs||[],notes:[]}),t.elapsed_ms,false);
+  }
+  if(sid){sessionId=sid}else{sessionId=(crypto.randomUUID?crypto.randomUUID().slice(0,8):Date.now().toString(36))}
+  flow.scrollTop=flow.scrollHeight;
+}
+function addPlaceholder(){
+  const e=document.createElement("div"); e.className="empty"; e.id="placeholder";
+  e.innerHTML=`对「${esc(currentTitle)}」的内容提问<br><span style="font-size:12px">例：视频里B费做了什么？第二个进球在哪一分钟？</span>`;
+  flow.appendChild(e);
+}
+
+/* ---------- 气泡 ---------- */
+function addUserBubble(text,scroll=true){
+  $("#placeholder")?.remove?.();
+  const b=document.createElement("div"); b.className="bubble user";
+  b.innerHTML=`<div class="av">我</div><div class="body"><div class="msg">${esc(text)}</div></div>`;
+  flow.appendChild(b); if(scroll)flow.scrollTop=flow.scrollHeight;
+  return b;
+}
+async function addAssistantBubble(streamPromise,elapsed,scroll=true){
+  const b=document.createElement("div"); b.className="bubble asst";
+  b.innerHTML=`<div class="av">知</div><div class="body"><div class="msg typing"></div>
+    <div class="meta">生成中…</div><div class="evcards"></div></div>`;
+  flow.appendChild(b); if(scroll)flow.scrollTop=flow.scrollHeight;
+  const msg=b.querySelector(".msg"), meta=b.querySelector(".meta"), ev=b.querySelector(".evcards");
+  const {text,refs,notes}=await streamPromise;
+  msg.classList.remove("typing");
+  msg.innerHTML=renderAnswer(text,refs);
+  meta.textContent=(elapsed?(elapsed/1000).toFixed(1)+"s · ":"")+(refs.length?`${refs.length} 条证据`:"");
+  if(notes&&notes.length)meta.title=notes.join("\n");
+  if(refs.length)ev.innerHTML=refs.map(evcard).join("");
+  bindEvcards(ev,refs);
+  flow.scrollTop=flow.scrollHeight;
+}
+function renderAnswer(text,refs){
+  refsMap=refsMap||{}; (refs||[]).forEach(r=>{refsMap[r.index]=r});
+  let html=esc(text);
+  html=html.replace(/\[(\d{1,2})\]/g,(m,n)=>refsMap[n]?`<span class="cite" data-n="${n}">[${n}] ${hms(refsMap[n].start_ms).slice(0,8)}</span>`:m);
+  return html;
+}
+function evcard(r){
+  const kf=(r.keyframe_paths&&r.keyframe_paths[0])?`/api/videos/${currentVideo}/keyframes/${r.keyframe_ids?.[0]||""}/image${TOKEN?"?token="+TOKEN:""}`:"";
+  return `<div class="evcard" data-n="${r.index}">
+    <div class="row">${kf?`<img src="${kf}" loading="lazy" onerror="this.remove()">`:""}
+    <div><div class="time" data-start="${r.start_ms}">${r.time_range}</div>
+    <div>${esc((r.text||"").slice(0,220))}${(r.text||"").length>220?"…":""}</div>
+    <div class="src">${esc(r.clip_id)}</div></div></div></div>`;
+}
+function bindEvcards(ev,refs){
+  ev.querySelectorAll(".time").forEach(el=>el.onclick=()=>{player.currentTime=(+el.dataset.start)/1000;player.play()});
+  ev.parentElement.querySelectorAll(".cite").forEach(c=>c.onclick=()=>{
+    const card=ev.querySelector(`.evcard[data-n="${c.dataset.n}"]`);
+    if(!card)return; ev.classList.add("open");
+    card.scrollIntoView({block:"nearest"});
+    player.currentTime=(refs[+c.dataset.n]?.start_ms||0)/1000;
+  });
+}
+
+/* ---------- 发送（SSE 打字机） ---------- */
+async function sendQuestion(){
+  const text=q.value.trim(); if(!text||busy||!currentVideo)return;
+  busy=true; send.disabled=true; stopBtn.style.display="inline-block";
+  q.value=""; q.style.height="auto";
+  addUserBubble(text);
+  let resolveOut; const streamPromise=new Promise(r=>resolveOut={resolve:(v)=>r(v)});
+  const pending=addAssistantBubble(streamPromise);
+  const msg=pending.querySelector(".msg"), meta=pending.querySelector(".meta");
+  let acc="", refs=[], notes=[], t0=performance.now();
+  ctrl=new AbortController();
+  try{
+    const resp=await fetch(`/api/videos/${currentVideo}/ask/stream`,{
+      method:"POST",headers:{...H(),"Content-Type":"application/json"},
+      body:JSON.stringify({question:text,session_id:sessionId}),signal:ctrl.signal});
+    if(!resp.ok||!resp.body)throw new Error("HTTP "+resp.status);
+    const reader=resp.body.getReader(),dec=new TextDecoder();
+    let buf="";
+    while(true){
+      const {done,value}=await reader.read(); if(done)break;
+      buf+=dec.decode(value,{stream:true});
+      let i;
+      while((i=buf.indexOf("\n\n"))>=0){
+        const line=buf.slice(0,i).trim(); buf=buf.slice(i+2);
+        if(!line.startsWith("data:"))continue;
+        const evt=JSON.parse(line.slice(5));
+        if(evt.type==="delta"){acc+=evt.data;msg.textContent=acc;flow.scrollTop=flow.scrollHeight}
+        else if(evt.type==="final"){
+          const R=evt.result; refs=R.refs||[]; notes=R.notes||[];
+          msg.innerHTML=renderAnswer(R.answer,refs);
+          meta.textContent=((performance.now()-t0)/1000).toFixed(1)+"s · "+
+            (R.backend||"")+(refs.length?` · ${refs.length} 条证据`:"")+(R.degraded?" · 降级":"");
+          if(refs.length){const ev=pending.querySelector(".evcards");
+            ev.innerHTML=refs.map(evcard).join("");bindEvcards(ev,refs)}
+          resolveOut({text:R.answer,refs,notes});
+        }else if(evt.type==="error"){throw new Error(evt.message)}
+      }
+    }
+    if(!acc)throw new Error("空响应");
+  }catch(err){
+    if(err.name==="AbortError"){meta.textContent="已停止";msg.textContent=acc||"（已停止）";
+      resolveOut({text:acc,refs:[],notes:[]})}
+    else{msg.classList.remove("typing");msg.textContent="出错了："+err.message;
+      resolveOut({text:"出错了："+err.message,refs:[],notes:[]})}
+  }finally{
+    msg.classList.remove("typing");busy=false;send.disabled=false;
+    stopBtn.style.display="none";ctrl=null;flow.scrollTop=flow.scrollHeight;
+  }
+}
+
+/* ---------- 交互 ---------- */
+send.onclick=sendQuestion;
+stopBtn.onclick=()=>ctrl?.abort();
+q.addEventListener("keydown",e=>{
+  if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendQuestion()}});
+q.addEventListener("input",()=>{q.style.height="auto";q.style.height=Math.min(140,q.scrollHeight)+"px"});
+$("#clearChat").onclick=async()=>{
+  if(!currentVideo)return;
+  await fetch(`/api/videos/${currentVideo}/chat?session_id=${sessionId}`,{method:"DELETE",headers:H()});
+  flow.innerHTML=""; addPlaceholder(); await loadSessions();
+};
+$("#newSession").onclick=()=>{
+  sessionId=(crypto.randomUUID?crypto.randomUUID().slice(0,8):Date.now().toString(36));
+  flow.innerHTML=""; addPlaceholder(); toast2("已开始新会话");
+};
+$("#exportChat").onclick=()=>{
+  if(!currentVideo)return;
+  window.open(`/api/videos/${currentVideo}/chat/export?session_id=${sessionId}${TOKEN?"&token="+TOKEN:""}`);
+};
+function toast2(msg){const t=document.createElement("div");
+  t.style.cssText="position:fixed;bottom:26px;left:50%;transform:translateX(-50%);background:#1d2330;border:1px solid #2e3542;padding:10px 22px;border-radius:10px;font-size:13px;z-index:9";
+  t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),2200)}
+player.addEventListener("timeupdate",()=>{$("#clock").textContent=
+  hms(player.currentTime*1000).slice(0,8)+" / "+hms((player.duration||0)*1000).slice(0,8)});
+loadVideos();
+</script>
+</body>
+</html>

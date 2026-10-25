@@ -70,6 +70,9 @@ media:
   ffprobe_timeout_ms: 30_000
   # 下载（yt-dlp）
   download:
+    # 下载源分辨率上限：分析链路真实需求只有关键帧 720 短边与视觉 448px，
+    # 720p 也是 B 站免登录可得的最高档。调回 1080 可改 1080。
+    format_max_height: 720
     max_retries: 3
     backoff_base: 2.0
     backoff_max: 60.0
@@ -103,6 +106,15 @@ media:
     dedupe_color_distance: 30.0
     dedupe_probe_side: 64
     dedupe_grid: 4
+    # 长视频检测加速（D4/Tier2）：超过 5 分钟的视频改走 ffmpeg+NVDEC 硬解、
+    # 480px 降采样打分（实测比 PySceneDetect 逐帧软解快一个量级）。
+    # long_video_use_ffmpeg: false 则退回 pyscedetect 跳帧档。
+    long_video_min_ms: 300000
+    long_video_frame_skip: 2
+    long_video_downscale: 4
+    long_video_use_ffmpeg: true
+    long_video_hwaccel: true
+    long_video_detect_width: 480
     keyframe:
       min_short_side: 720          # 短边不低于 720p，源更小则不放大只告警
       max_jpeg_bytes: 204800       # 200KB 硬上限
@@ -120,6 +132,9 @@ media:
 asr:
   # 默认 large-v3-turbo：large-v3 的解码器 32 层，turbo 只有 4 层，CPU 上快 6~8 倍。
   # 有 GPU（显存 >=8G）可改回 "faster-whisper-large-v3" 换一点 CER。
+  # 要更快（精度换速度，实测档位，均为可用选项）：
+  #   "faster-whisper-medium"（约 1.5G，精度略降）
+  #   "faster-whisper-small"  （约 0.5G，CPU 上数倍速，精度明显下降）
   model: "faster-whisper-large-v3-turbo"
   # null 表示自动跟随 models.device；可强制 "cuda" / "cpu"
   device: null
@@ -157,6 +172,22 @@ vl:
   # true = 按场景分组做连续理解（一段时间窗一次推理，产出叙述）
   # false = 退回逐帧独立描述（旧行为，每帧互不知情）
   sequence_mode: true
+  # ---- 视频段理解（云端 qwen-vl 直接吃短视频段，只对云端视觉生效）----
+  # auto  = 按场景密度分派：讲解类走抽帧（省钱），运动类走分段（看得懂动作）
+  # frames / segments = 强制单一模式（segments 无云端视觉时自动回落 frames）
+  video_mode: "auto"
+  # 单段时长上限（秒），超出按此再剪；段会重编码到 480p 控制上传体积
+  video_segment_max_s: 15
+  # 每视频最多走"段"的场景数（费用闸门），超出退回抽帧
+  video_segment_budget: 40
+  # 场景密度超过该值（次/分钟）判为高运动视频：auto 走段；本地视觉降档
+  high_motion_density_per_min: 20.0
+  # 高运动降档时把相邻场景合并到该跨度（毫秒）再抽帧
+  high_motion_scene_span_ms: 10000
+
+  # ---- 云端视觉（OpenAI 兼容协议）------
+  # 打开后优先走云端，本地 GGUF 作为回退。界面里可以填地址/模型/密钥。
+  cloud_enabled: false
 
 # -----------------------------------------------------------------------------
 # 向量化与检索
@@ -241,6 +272,7 @@ llm:
     temperature: 0.3
     max_tokens: 2048
   local:
+    # 速度优先的机器可切 "qwen3-4b-gguf"（CPU 上快约一倍，质量略降）。
     model: "qwen2.5-7b-gguf"
     n_ctx: 8192
     n_threads: null                 # null = 物理核数
@@ -325,6 +357,28 @@ gradio:
   theme: "soft"
   # 卡片式布局的每页条数
   page_size: 20
+
+# -----------------------------------------------------------------------------
+# 三层报告（改进 A/B）：综合总结 / 内容驱动脉络 / 修字解说词
+# -----------------------------------------------------------------------------
+report:
+  # 用 LLM 修正转写的同音错字与标点（保留原话、不增删内容）；关掉直接用原文
+  polish_transcript: true
+  # 每章最多提取的关键节点数 —— 脉络由内容决定，不做 30s 均匀切分
+  milestones_max_per_chapter: 5
+  # 单次修字的最大转写长度（字符），超出在章内再分块
+  polish_block_chars: 4000
+
+# -----------------------------------------------------------------------------
+# 多轮问答（C 端对话形态）：/chat 页与 ask/stream 共用
+# -----------------------------------------------------------------------------
+qa:
+  # 多轮：最近几轮问答作为 LLM 上下文前缀（进程内 LRU，重启即清）
+  multi_turn: true
+  # 检索前把"那第二个进球呢"这类指代追问改写成独立完整查询（多花一次小 LLM 调用）
+  query_rewrite: true
+  # 每视频保留的对话轮数
+  history_window: 8
 
 # -----------------------------------------------------------------------------
 # 输入输出硬约束（需求文档表 2）

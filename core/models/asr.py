@@ -21,6 +21,8 @@ faster-whisper 的 ``segment.start`` 是秒（float），这里 ``round`` 到毫
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from difflib import SequenceMatcher
 from functools import lru_cache
 import re
@@ -237,6 +239,13 @@ class Transcript:
 # --------------------------------------------------------------------------- #
 # 文本后处理
 # --------------------------------------------------------------------------- #
+def _ensure_cuda_dlls() -> None:
+    """挂载 CUDA 运行库目录（项目 runtime/ 与 pip 用户级安装均覆盖）。"""
+    from core.models._runtime import ensure_cuda_dlls  # noqa: PLC0415
+
+    ensure_cuda_dlls()
+
+
 def _looks_like_hallucination(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
@@ -267,20 +276,29 @@ def _clean_text(text: str) -> str:
 def _cuda_usable() -> bool:
     """CUDA 是否**真的**可用（不是"有没有设备"）。
 
-    判据优先用 torch：它一旦是 CPU-only 构建就返回 False，正好符合我们的场景
-    （本机 torch 2.14.0+cpu 而 CTranslate2 报 1 张卡，直接信 CT2 会白试三档）。
-    没有 torch 时退回 CTranslate2 的设备计数——不完美，但比不看更好。
+    判据以 **CTranslate2 优先**：跑转写的就是它，它数得到的卡就是真能用的卡。
+    曾经反过来"torch 优先"，结果 torch 是 CPU 构建（+cpu 轮子）时，CTranslate2
+    明明报 1 张卡也被判成不可用，白白全程 CPU —— 这正是"有 GPU 却全在
+    CPU 上跑"的一个来源。torch 只作为没有 CT2 时的旁证。
+
+    若 CUDA 运行库损坏（缺 cublas 等），首个 float16 档会在 load() 里抛错并
+    沿设备计划快速降级到 CPU（秒级代价，不是分钟级），因此这里宁可乐观。
     """
+    from core.models._runtime import ensure_cuda_dlls, ensure_torch_path  # noqa: PLC0415
+
+    ensure_torch_path()
+    ensure_cuda_dlls()
+    try:
+        import ctranslate2  # type: ignore[import-not-found]
+
+        if ctranslate2.get_cuda_device_count() > 0:
+            return True
+    except Exception:  # noqa: BLE001 - 没装 CT2 不该发生（asr 依赖它），兜住
+        pass
     try:
         import torch  # type: ignore[import-not-found]
 
         return bool(torch.cuda.is_available())
-    except Exception:  # noqa: BLE001 - 没装 torch / 驱动异常都当作不可用
-        pass
-    try:
-        import ctranslate2  # type: ignore[import-not-found]
-
-        return ctranslate2.get_cuda_device_count() > 0
     except Exception:  # noqa: BLE001
         return False
 
@@ -304,6 +322,9 @@ class AsrEngine:
         self._model_manager = model_manager
         self._model: Any = None
         self._loaded_key: tuple[str, str, str] | None = None
+        # D1：转写期 CUDA 运行库炸掉（典型：cublas64_12.dll 缺失，cuBLAS 惰性
+        # 加载，加载期探测不到）后置 True，强制后续按 CPU 计划重载重试。
+        self._force_cpu: bool = False
 
     # ---- 模型加载 --------------------------------------------------------- #
     def _manager(self) -> Any:
@@ -317,7 +338,11 @@ class AsrEngine:
         return Path(self._manager().ensure_model(self.config.model_name))
 
     def _device_plan(self) -> list[tuple[str, str]]:
-        """按优先级给出 ``(device, compute_type)`` 尝试序列。"""
+        """按优先级给出 ``(device, compute_type)`` 尝试序列。
+
+        ``_force_cpu``（转写期 CUDA 运行库炸过一次）后不再给 CUDA 档 ——
+        cuBLAS/cuDNN 是惰性加载，加载期的设备探测发现不了它缺失。
+        """
         requested = (self.config.device or "auto").lower()
         explicit = self.config.compute_type
         plan: list[tuple[str, str]] = []
@@ -326,7 +351,7 @@ class AsrEngine:
             if (device, compute) not in plan:
                 plan.append((device, compute))
 
-        if requested in {"cuda", "auto"}:
+        if requested in {"cuda", "auto"} and not self._force_cpu:
             # auto 必须先问一句"CUDA 到底能不能用"。CTranslate2 的
             # get_cuda_device_count() 只数设备、不验证运行库：本机它是 1，
             # 但 cublas64_12.dll 缺失，于是 float16/int8_float16/int8 三档
@@ -335,8 +360,8 @@ class AsrEngine:
                 for compute in (explicit or "float16", "int8_float16", "int8"):
                     if compute:
                         add("cuda", compute)
-        if requested in {"cpu", "auto", "mps"}:
-            if requested == "mps":
+        if requested in {"cpu", "auto", "mps"} or self._force_cpu:
+            if requested == "mps" and not self._force_cpu:
                 add("mps", explicit or "float32")
             for compute in (explicit or "int8", "float32"):
                 if compute:
@@ -353,6 +378,7 @@ class AsrEngine:
         except ImportError as exc:  # pragma: no cover - 取决于环境
             raise AsrError("未安装 faster-whisper，请执行 `pip install faster-whisper`") from exc
 
+        _ensure_cuda_dlls()
         model_path = self._model_path()
         plan = self._device_plan()
         key = (str(model_path), plan[0][0], plan[0][1])
@@ -545,20 +571,43 @@ class AsrEngine:
 
         try:
             raw_segments, info = model.transcribe(str(path), **options)
-            segments_list = list(raw_segments)
         except Exception as exc:  # noqa: BLE001 - 推理层异常一律降级
-            message = f"转写失败（{type(exc).__name__}）: {exc}"
-            logger.warning(message[:300])
-            warnings.append(message)
-            return Transcript(
-                video_id=video_id,
-                source="empty",
-                device=device,
-                compute_type=compute,
-                model_name=self.config.model_name,
-                degraded=True,
-                warnings=tuple(warnings),
-            )
+            # D1：CUDA 运行库（cublas/cudnn）惰性加载，加载期探测不到，
+            # 第一次真转写才炸。这里卸载重载到 CPU 再试一次 ——
+            # "退回 CPU 慢点出结果"远好于"空转录让整条语音通道报废"。
+            if device != "cpu" and not self._force_cpu:
+                logger.warning(
+                    "转写在 %s/%s 上失败（%s: %s），退回 CPU 重试一次",
+                    device, compute, type(exc).__name__, str(exc)[:160],
+                )
+                self.unload()
+                self._force_cpu = True
+                try:
+                    model = self.load()
+                    device, compute = self.active_device
+                    raw_segments, info = model.transcribe(str(path), **options)
+                except Exception as exc2:  # noqa: BLE001 - CPU 也失败才算真失败
+                    message = f"转写失败（CPU 回退后仍失败: {type(exc2).__name__}）: {exc2}"
+                    logger.warning(message[:300])
+                    warnings.append(message)
+                    return Transcript(
+                        video_id=video_id, source="empty", device=device,
+                        compute_type=compute, model_name=self.config.model_name,
+                        degraded=True, warnings=tuple(warnings),
+                    )
+                warnings.append(
+                    f"CUDA 转写失败（{type(exc).__name__}），已回退 {device}/{compute} 完成转写"
+                )
+            else:
+                message = f"转写失败（{type(exc).__name__}）: {exc}"
+                logger.warning(message[:300])
+                warnings.append(message)
+                return Transcript(
+                    video_id=video_id, source="empty", device=device,
+                    compute_type=compute, model_name=self.config.model_name,
+                    degraded=True, warnings=tuple(warnings),
+                )
+        segments_list = list(raw_segments)
 
         language = str(getattr(info, "language", "") or "")
         probability = float(getattr(info, "language_probability", 0.0) or 0.0)

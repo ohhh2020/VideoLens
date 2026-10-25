@@ -118,3 +118,6 @@ tests/fixtures/
 # Obsidian 插件的运行时设置
 clients/obsidian_plugin/data.json
 
+
+# 项目内 GPU 运行时（setup_gpu.py --runtime 装的 torch/CUDA 大件，随项目删除）
+runtime/

@@ -838,6 +838,9 @@ class ModelManager:
     @staticmethod
     def _detect_device() -> str:
         try:
+            from core.models._runtime import ensure_torch_path  # noqa: PLC0415
+
+            ensure_torch_path()
             import torch  # noqa: PLC0415
 
             if torch.cuda.is_available():

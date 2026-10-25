@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>知影 · 分析工作台</title>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--panel2:#1d2330;--border:#262b36;--border2:#2e3542;
+  --text:#e6e8ee;--muted:#98a2b3;--accent:#4f7cff;--ok:#3fbf7f;--warn:#e8c97a;--bad:#ff6b6b}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);
+  font:14px/1.65 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:0 20px 60px}
+
+/* 顶栏 */
+.nav{display:flex;align-items:center;gap:12px;padding:14px 0;margin-bottom:8px}
+.nav .brand{font-size:17px;font-weight:700}
+.nav .brand small{color:var(--muted);font-weight:400;font-size:11px;margin-left:8px}
+.nav .spacer{flex:1}
+.nav a{color:var(--text);text-decoration:none;font-size:13px;padding:6px 14px;
+  border-radius:9px;border:1px solid var(--border2);transition:.15s;white-space:nowrap}
+.nav a:hover{border-color:var(--accent);background:var(--panel2)}
+.nav a.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+
+/* 页签 */
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:18px}
+.tabs button{background:transparent;border:none;color:var(--muted);font:inherit;font-size:13.5px;
+  padding:9px 16px;border-radius:9px 9px 0 0;cursor:pointer}
+.tabs button.on{color:var(--text);font-weight:600;background:var(--panel2);
+  box-shadow:inset 0 -2px 0 var(--accent)}
+.tabpane{display:none}
+.tabpane.on{display:block}
+
+/* 卡片与表单 */
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin-bottom:14px}
+.card h3{margin:0 0 12px;font-size:14px;font-weight:600}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.grid .full{grid-column:1/-1}
+label{display:block;color:var(--muted);font-size:12px;margin-bottom:5px}
+input[type=text],input[type=password],select,textarea{width:100%;background:var(--panel2);
+  border:1px solid var(--border2);color:var(--text);border-radius:10px;padding:9px 12px;
+  font:inherit;outline:none;transition:border-color .15s}
+input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+.checks{display:flex;gap:18px;flex-wrap:wrap;margin:10px 0}
+.checks label{display:flex;align-items:center;gap:7px;color:var(--text);font-size:13px;margin:0;cursor:pointer}
+button.btn{background:var(--accent);border:none;color:#fff;border-radius:10px;
+  padding:10px 22px;font:inherit;font-weight:600;cursor:pointer}
+button.btn:hover{filter:brightness(1.1)}
+button.btn.ghost{background:var(--panel2);border:1px solid var(--border2);color:var(--text);font-weight:400}
+button.btn.danger{background:transparent;border:1px solid #5b2626;color:var(--bad);font-weight:400;padding:5px 12px;font-size:12px}
+button.btn:disabled{opacity:.45;cursor:default}
+
+/* 进度与分析结果 */
+.prog{height:8px;background:var(--panel2);border-radius:99px;overflow:hidden;margin:8px 0}
+.prog i{display:block;height:100%;width:0;background:linear-gradient(90deg,#4f7cff,#7aa2ff);transition:width .4s}
+.logline{color:var(--muted);font-size:12.5px;min-height:18px}
+.report{background:var(--panel2);border:1px solid var(--border);border-radius:10px;
+  padding:12px 16px;margin-top:10px;white-space:pre-wrap;font-size:13px;display:none}
+.report.show{display:block}
+.report b{color:var(--accent2,#7aa2ff)}
+
+/* 表格 */
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--muted);font-weight:600;padding:8px 10px;border-bottom:1px solid var(--border)}
+td{padding:8px 10px;border-bottom:1px solid var(--border)}
+tr:hover td{background:var(--panel2)}
+.pill{display:inline-block;padding:0 9px;border-radius:99px;font-size:11.5px}
+.pill.ready{background:#12351f;color:var(--ok)}
+.pill.failed{background:#3a1616;color:var(--bad)}
+.pill.other{background:#33270f;color:var(--warn)}
+a.tlink{color:var(--accent);text-decoration:none;font-size:12.5px;margin-right:8px}
+a.tlink:hover{text-decoration:underline}
+
+/* 状态与设置 */
+.stat{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.stat .item{background:var(--panel2);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+.stat .item b{display:block;font-size:20px;font-weight:700}
+.stat .item span{color:var(--muted);font-size:12px}
+.bar{height:6px;background:var(--panel2);border-radius:99px;overflow:hidden;margin-top:6px}
+.bar i{display:block;height:100%;background:var(--accent)}
+.backend{padding:8px 0;border-bottom:1px dashed var(--border);font-size:13px}
+.backend:last-child{border:none}
+.backend .on{color:var(--ok)}
+.backend .off{color:var(--muted)}
+.warnline{color:var(--warn);font-size:12px}
+.savehint{color:var(--muted);font-size:12px;margin-left:12px}
+.toast{position:fixed;bottom:26px;left:50%;transform:translateX(-50%);background:var(--panel2);
+  border:1px solid var(--border2);color:var(--text);padding:10px 22px;border-radius:10px;
+  font-size:13px;display:none;z-index:9}
+.toast.show{display:block}
+h2.sect{font-size:15px;margin:0 0 12px}
+.muted{color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="nav">
+    <div class="brand">知影 ZhiYing <small>本地优先 · 视频智能分析</small></div>
+    <div class="spacer"></div>
+    <a class="primary" href="/chat">💬 视频对话</a>
+    <a href="/docs" target="_blank">API 文档</a>
+    <a href="/api/health" target="_blank">服务状态</a>
+  </div>
+
+  <div class="tabs">
+    <button data-t="analyze" class="on">🎬 分析</button>
+    <button data-t="library">📚 视频库</button>
+    <button data-t="status">📊 状态</button>
+    <button data-t="settings">⚙️ 设置</button>
+  </div>
+
+  <!-- ============ 分析 ============ -->
+  <section class="tabpane on" id="p-analyze">
+    <div class="card">
+      <h3>提交分析任务</h3>
+      <label>视频来源（本地路径或链接）</label>
+      <textarea id="src" rows="2" placeholder="D:\videos\demo.mp4 或 https://www.bilibili.com/video/BVxxx"></textarea>
+      <div class="grid" style="margin-top:12px">
+        <div><label>标题（可选）</label><input type="text" id="title" placeholder="留空自动生成"></div>
+        <div><label>语言（可选）</label>
+          <select id="lang"><option value="">自动检测</option><option value="zh">中文</option><option value="en">英文</option></select></div>
+      </div>
+      <div class="checks">
+        <label><input type="checkbox" id="force">强制重跑</label>
+        <label><input type="checkbox" id="skipVision">跳过视觉理解（更快）</label>
+        <label><input type="checkbox" id="skipSummary">跳过总结</label>
+        <label><input type="checkbox" id="skipVectors">跳过向量入库</label>
+      </div>
+      <button class="btn" id="go">开始分析</button>
+      <span class="savehint" id="analyzeHint"></span>
+      <div class="prog" id="progWrap" style="display:none"><i id="prog"></i></div>
+      <div class="logline" id="progText"></div>
+    </div>
+    <div class="card" id="resultCard" style="display:none">
+      <h3 id="resultTitle">分析结果</h3>
+      <div id="resultBody" style="font-size:13px"></div>
+      <div style="margin-top:10px">
+        <a class="tlink" id="goChat" href="#">💬 去对话页追问 →</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 视频库 ============ -->
+  <section class="tabpane" id="p-library">
+    <div class="card">
+      <h3>视频库 <button class="btn ghost" id="refreshLib" style="float:right;padding:5px 14px;font-size:12px">刷新</button></h3>
+      <table>
+        <thead><tr><th>标题</th><th>状态</th><th>时长</th><th>切片</th><th>语言</th><th style="width:220px">操作</th></tr></thead>
+        <tbody id="libBody"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ 状态 ============ -->
+  <section class="tabpane" id="p-status">
+    <div class="card"><h3>容量与用量</h3><div class="stat" id="statBox"></div></div>
+    <div class="card"><h3>后端通道</h3><div id="backendBox"></div></div>
+  </section>
+
+  <!-- ============ 设置 ============ -->
+  <section class="tabpane" id="p-settings">
+    <div class="card">
+      <h3>大模型（云端）</h3>
+      <div class="grid">
+        <div><label>模式</label>
+          <select id="llm_mode"><option value="auto">auto（云端优先，本地兜底）</option><option value="cloud">cloud（仅云端）</option><option value="local">local（仅本地）</option></select></div>
+        <div><label>API Key（留空不动；填空串清除）</label><input type="password" id="llm_key" placeholder="sk-…"></div>
+        <div class="full"><label>base_url（OpenAI 兼容）</label>
+          <input type="text" id="llm_base" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1"></div>
+        <div><label>模型名</label><input type="text" id="llm_model" placeholder="qwen-plus"></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>视觉理解（云端）</h3>
+      <div class="checks"><label><input type="checkbox" id="vl_on">启用云端视觉（运动视频建议开，走视频段理解）</label></div>
+      <div class="grid">
+        <div><label>API Key（留空不动）</label><input type="password" id="vl_key" placeholder="同上 Key 可复用"></div>
+        <div><label>base_url</label><input type="text" id="vl_base"></div>
+        <div><label>模型名</label><input type="text" id="vl_model" placeholder="qwen-vl-plus"></div>
+        <div><label>推理设备</label>
+          <select id="device"><option value="auto">auto</option><option value="cuda">cuda</option><option value="cpu">cpu</option></select></div>
+      </div>
+    </div>
+    <button class="btn" id="saveSet">保存设置</button>
+    <span class="savehint">保存即写入 user_settings；云端/模型通道的完整生效需重启服务</span>
+    <div class="card" style="margin-top:14px"><h3>当前通道状态</h3><div id="setBackends"></div></div>
+  </section>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $=s=>document.querySelector(s), $$=s=>document.querySelectorAll(s);
+const TOKEN=(new URLSearchParams(location.search)).get("token")||"";
+const H=()=>TOKEN?{"X-API-Token":TOKEN}:{};
+const HJ=()=>({...H(),"Content-Type":"application/json"});
+const esc=t=>(t||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const hms=ms=>{const s=Math.max(0,Math.floor((ms||0)/1000)),h=~~(s/3600),m=~~(s%3600/60),x=s%60;
+  return [h,m,x].map(v=>String(v).padStart(2,"0")).join(":")};
+let toastTimer=null;
+function toast(msg){const t=$("#toast");t.textContent=msg;t.classList.add("show");
+  clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove("show"),2600)}
+
+/* ---------- 页签 ---------- */
+$$(".tabs button").forEach(b=>b.onclick=()=>{
+  $$(".tabs button").forEach(x=>x.classList.toggle("on",x===b));
+  $$(".tabpane").forEach(p=>p.classList.toggle("on",p.id==="p-"+b.dataset.t));
+  if(b.dataset.t==="library")loadLibrary();
+  if(b.dataset.t==="status")loadStatus();
+  if(b.dataset.t==="settings")loadSettings();
+});
+
+/* ---------- 分析 ---------- */
+let pollTimer=null;
+$("#go").onclick=async()=>{
+  const src=$("#src").value.trim();
+  if(!src){toast("请填写视频来源");return}
+  $("#go").disabled=true; $("#analyzeHint").textContent="已提交，排队中…";
+  $("#progWrap").style.display="block"; $("#prog").style.width="2%";
+  $("#progText").textContent="提交中…"; $("#resultCard").style.display="none";
+  try{
+    const r=await fetch("/api/videos/analyze",{method:"POST",headers:HJ(),body:JSON.stringify({
+      source:src, title:$("#title").value.trim()||undefined,
+      language:$("#lang").value||undefined,
+      force:$("#force").checked, skip_vision:$("#skipVision").checked,
+      skip_summary:$("#skipSummary").checked, skip_vectors:$("#skipVectors").checked})});
+    if(!r.ok)throw new Error((await r.json()).detail||("HTTP "+r.status));
+    const {task_id}=await r.json();
+    $("#analyzeHint").textContent="task_id: "+task_id;
+    clearInterval(pollTimer);
+    pollTimer=setInterval(async()=>{
+      const t=await (await fetch("/api/tasks/"+task_id,{headers:H()})).json();
+      $("#prog").style.width=Math.round((t.progress||0)*100)+"%";
+      $("#progText").textContent=(t.stage||"")+" — "+(t.message||"")+
+        (t.elapsed_ms?" · 已用 "+Math.round(t.elapsed_ms/1000)+"s":"");
+      if(t.status==="done"||t.status==="failed"){
+        clearInterval(pollTimer); $("#go").disabled=false;
+        showResult(t); loadLibrary();
+      }
+    },1200);
+  }catch(e){
+    $("#go").disabled=false;$("#progText").textContent="提交失败："+e.message;toast("提交失败")
+  }
+};
+function showResult(t){
+  const rep=t.report||{};
+  $("#resultCard").style.display="block";
+  $("#resultTitle").textContent=t.status==="done"?"✅ 分析完成":"❌ 分析未完成";
+  if(t.status==="failed"){$("#resultBody").innerHTML='<span style="color:var(--bad)">'+esc(t.error||"未知错误")+"</span>";return}
+  const rows=[["video_id",rep.video_id],["标题",rep.title],["时长",hms(rep.duration_ms)],
+    ["切片",rep.clip_count],["关键帧",rep.keyframe_count],["向量",rep.vector_count],
+    ["转录来源",rep.transcript_source||"-"],["语言",rep.language||"-"]];
+  $("#resultBody").innerHTML=rows.map(([k,v])=>`<div><b>${k}</b>  ${esc(String(v??"-"))}</div>`).join("")
+    +(rep.summary?`<div style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px">${esc(rep.summary.slice(0,600))}</div>`:"");
+  if(rep.video_id)$("#goChat").href="/chat?video_id="+rep.video_id;
+}
+
+/* ---------- 视频库 ---------- */
+async function loadLibrary(){
+  const items=await (await fetch("/api/videos?limit=100",{headers:H()})).json();
+  const body=$("#libBody"); body.innerHTML="";
+  if(!items.length){body.innerHTML='<tr><td colspan="6" class="muted">还没有视频——切到「分析」页签提交一个</td></tr>';return}
+  for(const v of items){
+    const ready=v.status==="ready";
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td>${esc(v.title||v.display_name||v.video_id)}</td>
+      <td><span class="pill ${ready?"ready":v.status==="failed"?"failed":"other"}">${esc(v.status)}</span></td>
+      <td>${hms(v.duration_ms)}</td><td>-</td><td>${esc(v.language||"-")}</td>
+      <td>${ready?`<a class="tlink" href="/chat?video_id=${v.video_id}">💬 对话</a>
+                   <a class="tlink" href="#" data-act="del" data-id="${v.video_id}">删除</a>`
+                 :`<a class="tlink" href="#" data-act="del" data-id="${v.video_id}">删除</a>`}</td>`;
+    body.appendChild(tr);
+  }
+  body.querySelectorAll('[data-act="del"]').forEach(a=>a.onclick=async e=>{
+    e.preventDefault(); const id=a.dataset.id;
+    if(!confirm("删除视频 "+id+" 及其切片/关键帧/向量？"))return;
+    await fetch("/api/videos/"+id,{method:"DELETE",headers:H()});
+    toast("已删除"); loadLibrary();
+  });
+}
+$("#refreshLib").onclick=loadLibrary;
+
+/* ---------- 状态 ---------- */
+async function loadStatus(){
+  const s=await (await fetch("/api/stats",{headers:H()})).json();
+  const h=await (await fetch("/api/health")).json();
+  const cap=(k,v,lim)=>`<div class="item"><b>${v}</b><span>${k}</span>
+    <div class="bar"><i style="width:${lim?Math.min(100,v/lim*100):0}%"></i></div></div>`;
+  const u=s.usage||{};
+  $("#statBox").innerHTML=
+    cap("视频 / 200",s.videos,u.videos)+cap("切片 / 5万",s.clips,u.clips)+
+    cap("转录片段 / 50万",s.transcript_segments,u.transcript_segments)+
+    cap("关键帧 / 10万",s.keyframes,u.keyframes)+
+    `<div class="item"><b>${(s.keyframe_bytes/1048576).toFixed(0)} MB</b><span>关键帧占用</span></div>
+     <div class="item"><b>${h.status}</b><span>服务 · ${h.device||"-"} · ${h.auth}</span></div>`;
+  const st=await (await fetch("/api/settings",{headers:H()})).json();
+  $("#backendBox").innerHTML=(st.backends||[]).map(b=>
+    `<div class="backend"><span class="${b.enabled?"on":"off"}">${b.enabled?"●":"○"}</span>
+     <b>${esc(b.name)}</b> — ${esc(b.detail)}${b.warning?` <div class="warnline">⚠ ${esc(b.warning)}</div>`:""}</div>`).join("");
+}
+
+/* ---------- 设置 ---------- */
+async function loadSettings(){
+  const st=await (await fetch("/api/settings",{headers:H()})).json();
+  const v=st.values||{};
+  $("#llm_mode").value=v["llm.mode"]||"auto";
+  $("#llm_base").value=v["llm.cloud.base_url"]||"";
+  $("#llm_model").value=v["llm.cloud.model"]||"";
+  $("#llm_key").value=v["llm.cloud.api_key"]||"";
+  $("#llm_key").placeholder=v["llm.cloud.api_key"]?"（已保存，打码显示）":"sk-…";
+  $("#vl_on").checked=!!v["vl.cloud_enabled"];
+  $("#vl_base").value=v["vl.cloud_base_url"]||"";
+  $("#vl_model").value=v["vl.cloud_model"]||"";
+  $("#vl_key").value=v["vl.cloud_api_key"]||"";
+  $("#device").value=v["models.device"]||"auto";
+  $("#setBackends").innerHTML=(st.backends||[]).map(b=>
+    `<div class="backend"><span class="${b.enabled?"on":"off"}">${b.enabled?"●":"○"}</span>
+     <b>${esc(b.name)}</b> — ${esc(b.detail)}</div>`).join("");
+}
+$("#saveSet").onclick=async()=>{
+  const payload={};
+  const put=(k,el)=>{const val=el.type==="password"?el.value:el.value.trim(); if(val!=="")payload[k]=val};
+  payload["llm.mode"]=$("#llm_mode").value;
+  put("llm.cloud.base_url",$("#llm_base")); put("llm.cloud.model",$("#llm_model"));
+  put("llm.cloud.api_key",$("#llm_key"));
+  payload["vl.cloud_enabled"]=$("#vl_on").checked;
+  put("vl.cloud_base_url",$("#vl_base")); put("vl.cloud_model",$("#vl_model"));
+  put("vl.cloud_api_key",$("#vl_key"));
+  payload["models.device"]=$("#device").value;
+  const r=await fetch("/api/settings",{method:"POST",headers:HJ(),body:JSON.stringify(payload)});
+  if(!r.ok){toast("保存失败："+((await r.json()).detail||r.status));return}
+  const st=await r.json();
+  $("#setBackends").innerHTML=(st.backends||[]).map(b=>
+    `<div class="backend"><span class="${b.enabled?"on":"off"}">${b.enabled?"●":"○"}</span>
+     <b>${esc(b.name)}</b> — ${esc(b.detail)}</div>`).join("");
+  toast("设置已保存");
+};
+
+loadLibrary(); loadStatus();
+</script>
+</body>
+</html>

@@ -64,7 +64,9 @@ __all__ = [
     "OpenAICompatibleBackend",
     "VALID_ROLES",
     "detect_local_server",
+    "llama_gpu_offload_supported",
     "local_server_backend",
+    "resolve_gpu_layers",
 ]
 
 VALID_ROLES: Final[frozenset[str]] = frozenset({"system", "user", "assistant"})
@@ -706,6 +708,42 @@ class KeywordBackend:
 # =============================================================================
 
 
+def llama_gpu_offload_supported() -> bool:
+    """当前 llama-cpp-python 构建是否支持 GPU 卸载。
+
+    PyPI 上的默认轮子是 **CPU 构建**——传 ``n_gpu_layers=-1`` 会被静默忽略，
+    模型照跑 CPU，只在日志深处留痕。这里显式探测，让调用方能给出
+    "运行 python scripts/setup_gpu.py 换 GPU 版"的明确指引。
+    老版本没有该函数时保守返回 True（保持原行为）。
+    """
+    try:
+        from llama_cpp import llama_supports_gpu_offload  # noqa: PLC0415
+
+        return bool(llama_supports_gpu_offload())
+    except ImportError:
+        try:
+            from llama_cpp import lib  # noqa: PLC0415
+
+            return bool(getattr(lib, "llama_supports_gpu_offload", lambda: True)())
+        except Exception:  # noqa: BLE001
+            return True
+    except Exception:  # noqa: BLE001 - 探测本身不该阻断装配
+        return True
+
+
+def resolve_gpu_layers(cfg: AppConfig) -> int:
+    """按配置与实际构建决定 n_gpu_layers，附明确告警。"""
+    if cfg.models.device not in {"auto", "cuda"}:
+        return 0
+    if not llama_gpu_offload_supported():
+        logger.warning(
+            "llama-cpp-python 是 CPU 构建（无 CUDA），本地推理只能跑 CPU。"
+            "有 NVIDIA 显卡的话，运行 python scripts/setup_gpu.py 一键换 GPU 版。"
+        )
+        return 0
+    return -1
+
+
 def detect_local_server(
     candidates: Sequence[str] = (
         "http://127.0.0.1:11434/v1",
@@ -842,14 +880,13 @@ class LlmGateway:
             try:
                 model_dir = Path(manager.ensure_model(local_cfg.model))
                 weight = _pick_llm_weights(model_dir)
-                n_gpu_layers = -1 if cfg.models.device in {"auto", "cuda"} else 0
                 backends.append(
                     LlamaCppChatBackend(
                         weight,
                         local_cfg.model,
                         n_ctx=local_cfg.n_ctx,
                         n_threads=local_cfg.n_threads,
-                        n_gpu_layers=n_gpu_layers,
+                        n_gpu_layers=resolve_gpu_layers(cfg),
                     )
                 )
                 logger.info("本地 LLM 就绪: %s (%s)", local_cfg.model, weight.name)

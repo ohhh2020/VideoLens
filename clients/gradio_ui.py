@@ -44,6 +44,15 @@ __all__ = ["UiError", "build_ui", "main", "describe_stage", "load_orchestrator"]
 #: 两个保存并发触发会同时 close 掉对方正在用的编排器。
 _REBUILD_LOCK = threading.Lock()
 
+#: 界面上"正在分析"的源（规范化）：重复点击同一视频直接提示，不再排队。
+#: （HTTP/MCP 侧由 api.jobs 的同源去重兜底，这里只管 UI 的即时反馈。）
+_ACTIVE_SOURCES: set[str] = set()
+_ACTIVE_SOURCES_LOCK = threading.Lock()
+
+
+def _source_key(text: str) -> str:
+    return " ".join((text or "").strip().split()).lower()
+
 
 class UiError(RuntimeError):
     """Web 端不可用（缺 gradio、编排器装配失败等）。"""
@@ -228,7 +237,23 @@ def _analyze_stream(state: _State, source: str, opts: dict[str, Any]
     if not source:
         yield "### ⚠️ 请填写本地路径或视频链接", "等待输入"
         return
+    key = _source_key(source)
+    with _ACTIVE_SOURCES_LOCK:
+        if key in _ACTIVE_SOURCES:
+            yield ("### ⚠️ 该视频正在分析中\n\n请等当前任务完成再提交 —— 重复提交"
+                   "不会更快，只会互相排队。切到「视频库」页签可看进度。",
+                   "重复提交已拦截")
+            return
+        _ACTIVE_SOURCES.add(key)
+    try:
+        yield from _analyze_stream_locked(state, source, opts)
+    finally:
+        with _ACTIVE_SOURCES_LOCK:
+            _ACTIVE_SOURCES.discard(key)
 
+
+def _analyze_stream_locked(state: _State, source: str, opts: dict[str, Any]
+                           ) -> Iterator[tuple[str, str]]:
     progress_queue: "queue.Queue[tuple[str, float, str]]" = queue.Queue(maxsize=512)
     box: dict[str, Any] = {}
     worker = threading.Thread(
@@ -784,6 +809,84 @@ def _format_backends_now(state: _State) -> str:
 # =============================================================================
 
 
+#: 主界面主题：与 /chat 页同一套设计语言（深色、#4f7cff 主色）。
+#: Gradio 6 的 Blocks 支持 css= 与 theme=；CSS 用宽泛选择器保证跨小版本不碎。
+UI_CSS = """
+:root{--zy-bg:#0f1115;--zy-panel:#171a21;--zy-panel2:#1d2330;--zy-border:#262b36;
+--zy-border2:#2e3542;--zy-text:#e6e8ee;--zy-muted:#98a2b3;--zy-accent:#4f7cff}
+.gradio-container{background:var(--zy-bg)!important;color:var(--zy-text)!important;
+  max-width:1280px!important;margin:0 auto!important}
+.gradio-container footer{display:none!important}
+footer,[class*="footer"]{display:none!important}
+/* 顶栏导航（样式兜底；正式样式内嵌在 _UI_HEADER 的 iframe 内） */
+.zy-nav{display:flex;align-items:center;gap:14px;padding:14px 18px;margin-bottom:10px;
+  background:var(--zy-panel);border:1px solid var(--zy-border);border-radius:14px}
+.zy-nav .brand{font-size:17px;font-weight:700;letter-spacing:.5px}
+.zy-nav .brand small{color:var(--zy-muted);font-weight:400;font-size:11px;margin-left:8px}
+.zy-nav a.zy-link{color:var(--zy-text);text-decoration:none;font-size:13px;
+  padding:6px 14px;border-radius:9px;border:1px solid var(--zy-border2);transition:.15s}
+.zy-nav a.zy-link:hover{border-color:var(--zy-accent);background:var(--zy-panel2)}
+.zy-nav a.zy-link.primary{background:var(--zy-accent);border-color:var(--zy-accent);
+  color:#fff;font-weight:600}
+.zy-nav .spacer{flex:1}
+/* 页签 */
+.tab-nav{border-bottom:1px solid var(--zy-border)!important;gap:4px!important}
+.tab-nav button{font-size:13.5px!important;padding:9px 16px!important;border-radius:9px 9px 0 0!important;
+  color:var(--zy-muted)!important;border:none!important;background:transparent!important}
+.tab-nav button.selected{color:var(--zy-text)!important;font-weight:600!important;
+  background:var(--zy-panel2)!important;box-shadow:inset 0 -2px 0 var(--zy-accent)!important}
+/* 面板与组件 */
+.block,.form,.panel{background:var(--zy-panel)!important;border-color:var(--zy-border)!important;
+  border-radius:12px!important}
+.gr-box{background:var(--zy-panel2)!important;border-color:var(--zy-border)!important;
+  border-radius:10px!important;color:var(--zy-text)!important}
+label span{color:var(--zy-muted)!important;font-size:12px!important}
+label,label>span,span[data-testid="block-info"]{background:transparent!important;
+  box-shadow:none!important;border:none!important;color:var(--zy-muted)!important}
+input[type=text],input[type=number],textarea{background:var(--zy-panel2)!important;
+  color:var(--zy-text)!important;border:1px solid var(--zy-border2)!important;border-radius:10px!important}
+input:focus,textarea:focus{border-color:var(--zy-accent)!important}
+/* 按钮 */
+button.primary:not(.tab-nav button),button.lg.primary,
+.gradio-container button[class*="primary"]:not(.tab-nav button){background:var(--zy-accent)!important;
+  border:none!important;border-radius:10px!important;font-weight:600!important;color:#fff!important}
+button.secondary:not(.tab-nav button){background:var(--zy-panel2)!important;
+  border:1px solid var(--zy-border2)!important;border-radius:10px!important;color:var(--zy-text)!important}
+button:hover{filter:brightness(1.08)}
+/* 表格与数据帧 */
+table{background:transparent!important;color:var(--zy-text)!important}
+th{background:var(--zy-panel2)!important;color:var(--zy-muted)!important;font-weight:600!important}
+td{border-color:var(--zy-border)!important}
+/* Markdown 区 */
+.prose h1{font-size:20px!important;margin:0 0 4px!important}
+.prose,.prose p{color:var(--zy-text)!important}
+"""
+
+#: 顶栏：品牌 + 全局入口。gr.HTML 在 iframe 里渲染（父页 CSS 够不到），
+#: 所以样式必须**内嵌在这段 HTML 里**自包含。
+_UI_HEADER = """
+<style>
+  .zy-nav{display:flex;align-items:center;gap:12px;padding:14px 18px;margin:0 0 10px;
+    background:#171a21;border:1px solid #262b36;border-radius:14px;
+    font:14px/1.5 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .zy-nav .brand{font-size:17px;font-weight:700;color:#e6e8ee;letter-spacing:.5px}
+  .zy-nav .brand small{color:#98a2b3;font-weight:400;font-size:11px;margin-left:8px}
+  .zy-nav .spacer{flex:1}
+  .zy-nav a{color:#e6e8ee;text-decoration:none;font-size:13px;padding:6px 14px;
+    border-radius:9px;border:1px solid #2e3542;transition:.15s;white-space:nowrap}
+  .zy-nav a:hover{border-color:#4f7cff;background:#1d2330}
+  .zy-nav a.zy-primary{background:#4f7cff;border-color:#4f7cff;color:#fff;font-weight:600}
+</style>
+<div class="zy-nav">
+  <div class="brand">知影 ZhiYing <small>本地优先 · 视频智能分析</small></div>
+  <div class="spacer"></div>
+  <a class="zy-primary" href="/chat" target="_top">💬 视频对话</a>
+  <a href="/docs" target="_top">API 文档</a>
+  <a href="/api/health" target="_top">服务状态</a>
+</div>
+"""
+
+
 def build_ui(*, config_path: str | None = None, orchestrator: Any | None = None,
              load_models: bool = False) -> Any:
     """构造 ``gr.Blocks``。``orchestrator`` 传入时不再装配（便于测试/复用）。"""
@@ -797,16 +900,16 @@ def build_ui(*, config_path: str | None = None, orchestrator: Any | None = None,
         cfg = get_app_config()
     state = _State(orch=orch, cfg=cfg, frames_dir=Path(cfg.path("frames")))
 
-    # Gradio 6 起 theme 从 Blocks() 移到了 launch()，这里只留 title
+    # Gradio 6 起 theme 从 Blocks() 移到了 launch()，这里只留 title + css
     with gr.Blocks(title="知影 · 视频智能分析") as demo:
+        gr.HTML(_UI_HEADER)
         gr.Markdown(
-            "# 知影 · 视频智能分析\n"
             "本地优先：视频、转录、关键帧与向量都留在本机。"
             "每条回答都带 `video_id` / `clip_id` / 毫秒时间戳。"
         )
 
         # -- 分析 ----------------------------------------------------------
-        with gr.Tab("① 分析"):
+        with gr.Tab("🎬 分析"):
             with gr.Row():
                 with gr.Column(scale=3):
                     source = gr.Textbox(
@@ -839,7 +942,7 @@ def build_ui(*, config_path: str | None = None, orchestrator: Any | None = None,
             )
 
         # -- 视频库 --------------------------------------------------------
-        with gr.Tab("② 视频库"):
+        with gr.Tab("📚 视频库"):
             with gr.Row():
                 refresh_btn = gr.Button("刷新", size="sm")
                 limit_box = gr.Number(value=50, label="条数", precision=0, scale=1)
@@ -856,7 +959,7 @@ def build_ui(*, config_path: str | None = None, orchestrator: Any | None = None,
                       api_name="load_videos")
 
         # -- 详情 ----------------------------------------------------------
-        with gr.Tab("③ 时间线"):
+        with gr.Tab("🎞️ 时间线"):
             with gr.Row():
                 video_pick = gr.Dropdown(choices=state.video_choices(), label="视频", scale=3)
                 detail_btn = gr.Button("加载", size="sm", scale=1)
@@ -878,7 +981,7 @@ def build_ui(*, config_path: str | None = None, orchestrator: Any | None = None,
                                   outputs=[video_pick], api_name="video_choices")
 
         # -- 问答 ----------------------------------------------------------
-        with gr.Tab("④ 问答"):
+        with gr.Tab("💬 问答"):
             with gr.Row():
                 q_video = gr.Dropdown(choices=state.video_choices(), label="视频", scale=2)
                 q_topk = gr.Slider(minimum=1, maximum=20, value=6, step=1, label="检索条数",
@@ -901,7 +1004,7 @@ def build_ui(*, config_path: str | None = None, orchestrator: Any | None = None,
                           api_name="ask")
 
         # -- 设置 ----------------------------------------------------------
-        with gr.Tab("⑤ 状态"):
+        with gr.Tab("📊 状态"):
             stat_btn = gr.Button("刷新用量", size="sm")
             stats_md = gr.Markdown(_stats_markdown(state))
             stat_btn.click(fn=lambda: _stats_markdown(state), outputs=[stats_md],
@@ -924,7 +1027,7 @@ def build_ui(*, config_path: str | None = None, orchestrator: Any | None = None,
             )
 
         # -- 设置 ----------------------------------------------------------
-        with gr.Tab("⑥ 设置"):
+        with gr.Tab("⚙️ 设置"):
             gr.Markdown(
                 "改完点「保存并应用」。设置写在 `data/user_settings.json`，"
                 "优先于 `configs/app_config.yaml`，但会被环境变量 `ZH_YING__*` 顶掉。"
@@ -1090,6 +1193,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         allowed_paths=[str(state.frames_dir)],
         show_error=True,
         theme=theme,
+        css=UI_CSS,  # Gradio 6：css 与 theme 一样走 launch()，Blocks(css=) 被忽略
     )
     return 0
 

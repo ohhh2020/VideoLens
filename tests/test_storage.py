@@ -53,8 +53,9 @@ def main() -> int:
     check("schema 版本正确", repo.schema_version() == SCHEMA_VERSION, str(repo.schema_version()))
     tables = repo.table_names()
     check(
-        "六张表齐备",
-        set(tables) == {"videos", "clips", "transcript_segments", "keyframes", "tasks", "artifacts"},
+        "七张表齐备（v4 加 qa_history）",
+        set(tables) == {"videos", "clips", "transcript_segments", "keyframes", "tasks",
+                        "artifacts", "qa_history"},
         str(tables),
     )
     check("journal_mode=wal", 

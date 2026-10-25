@@ -348,6 +348,19 @@ check("幻觉行被丢弃", all("点赞" not in s.text for s in tr_h.segments), 
 check("重复行被丢弃", len(tr_h.segments) == 1, str([s.text for s in tr_h.segments]))
 check("保留正常文本", tr_h.segments[0].text == "真正的正文内容", tr_h.segments[0].text)
 
+print("\n  -- 下载器路径绝对化 --")
+# 回归：曾因直接取 paths.videos 的相对字符串，yt-dlp 把它解析到
+# paths.temp 基准目录下，产出 data\temp\data\videos\... 双重路径并触发重试。
+from core.config import load_app_config as _lac  # noqa: PLC0415
+from core.media.downloader import DownloadConfig as _DC  # noqa: PLC0415
+
+_cfg = _lac(root=str(ROOT))
+_dl_cfg = _DC.from_config(_cfg)
+check("videos_dir 为绝对路径", _dl_cfg.videos_dir.is_absolute(), _dl_cfg.videos_dir)
+check("temp_dir 为绝对路径", (_dl_cfg.temp_dir or Path()).is_absolute(), _dl_cfg.temp_dir)
+check("videos_dir 与 cfg.path 一致", _dl_cfg.videos_dir == _cfg.path("videos"),
+      (_dl_cfg.videos_dir, _cfg.path("videos")))
+
 print(f"\n{'=' * 46}\nPASS {PASS}  FAIL {len(FAIL)}\n{'=' * 46}")
 for item in FAIL:
     print(" FAIL:", item, file=sys.stderr)

@@ -121,6 +121,9 @@ def detect_device(prefer: str = "auto") -> str:
     want = (prefer or "auto").strip().lower()
     if want not in {"auto", ""}:
         return want
+    from core.models._runtime import ensure_torch_path  # noqa: PLC0415
+
+    ensure_torch_path()
     try:
         import torch  # noqa: PLC0415
     except ImportError:

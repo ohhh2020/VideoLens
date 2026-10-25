@@ -292,6 +292,39 @@ def main() -> int:
     check("引用含毫秒时间戳", ref["end_ms"] > ref["start_ms"] >= 0, ref)
     check("引用含原文", bool(ref["text"]), ref["text"][:40])
 
+    print("\n=== 6c. 流式问答（SSE） ===")
+    with client.stream("POST", f"/api/videos/{video_id}/ask/stream",
+                       json={"question": "切片长度是怎么定的"}) as stream:
+        check("stream 200", stream.status_code == 200, stream.status_code)
+        check("stream content-type",
+              "text/event-stream" in stream.headers.get("content-type", ""),
+              stream.headers.get("content-type"))
+        events = []
+        for line in stream.iter_lines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+    kinds = [e.get("type") for e in events]
+    check("有 meta 事件", "meta" in kinds, kinds)
+    check("有 delta 事件", "delta" in kinds, kinds)
+    check("有 final 事件", "final" in kinds, kinds)
+    check("事件顺序 meta→delta→final",
+          kinds.index("meta") < kinds.index("delta") < kinds.index("final"), kinds)
+    final_evt = next((e for e in events if e.get("type") == "final"), {})
+    final_result = final_evt.get("result") or {}
+    check("final 带回答", bool((final_result.get("answer") or "").strip()))
+    check("final 带引用", len(final_result.get("refs") or []) >= 1,
+          len(final_result.get("refs") or []))
+    check("final 带 backend", bool(final_result.get("backend")), final_result.get("backend"))
+    with client.stream("POST", "/api/videos/vnope/ask/stream",
+                       json={"question": "在吗"}) as stream2:
+        ev2 = [json.loads(line[6:]) for line in stream2.iter_lines()
+               if line.startswith("data: ")]
+    check("未知视频流式返回带说明的 final",
+          any(e.get("type") == "final"
+              and "视频不存在" in "".join((e.get("result") or {}).get("notes") or [])
+              for e in ev2),
+          [e.get("type") for e in ev2])
+
     print("\n=== 6b. 章节 ===")
     r = client.get(f"/api/videos/{video_id}/chapters", params={"min_seconds": 600})
     check("chapters 200", r.status_code == 200, f"{r.status_code} {r.text[:200]}")
@@ -445,6 +478,27 @@ def main() -> int:
     check("HTTP MCP 返回工具", len(r.json()["result"]["tools"]) >= 8, r.status_code)
     r = client.get("/api/mcp/tools")
     check("GET /api/mcp/tools", r.status_code == 200 and "tools" in r.json(), r.status_code)
+
+    print("\n=== 11b. /chat 对话页 ===")
+    r = client.get("/chat")
+    check("chat 页 200", r.status_code == 200, r.status_code)
+    check("chat 页是 HTML", "text/html" in r.headers.get("content-type", "") and "视频对话" in r.text)
+    r = client.get(f"/api/videos/{video_id}/file")
+    check("视频文件流 200", r.status_code == 200, r.status_code)
+    check("视频文件是 mp4", r.headers.get("content-type", "").startswith("video/mp4"),
+          r.headers.get("content-type"))
+    check("视频文件有字节", len(r.content) > 100_000, len(r.content))
+    check("文件流带 Range 能力", r.headers.get("accept-ranges") == "bytes")
+    check("未知视频文件 404", client.get("/api/videos/vnope/file").status_code == 404)
+    r = client.post(f"/api/videos/{video_id}/ask", json={"question": "切片长度是怎么定的"})
+    check("对话前先问一轮", r.status_code == 200, r.status_code)
+    r = client.get(f"/api/videos/{video_id}/chat")
+    body = r.json()
+    check("会话历史有轮次", body["count"] >= 1 and bool(body["turns"][-1]["answer"]), body.get("count"))
+    check("历史含提问", body["turns"][-1]["question"] == "切片长度是怎么定的")
+    r = client.delete(f"/api/videos/{video_id}/chat")
+    check("清空对话", r.status_code == 200 and r.json()["cleared"] is True)
+    check("清空后为空", client.get(f"/api/videos/{video_id}/chat").json()["count"] == 0)
 
     print("\n=== 11. 统计与删除 ===")
     r = client.get("/api/stats")

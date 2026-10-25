@@ -6,6 +6,8 @@
 - 语言/环境：Python 3.11+ ｜ Windows 11 / Linux ｜ CPU 可跑，有 GPU 自动加速
 - 规模：约 2 万行（含测试），17 个顶层配置段（含嵌套 27 个），19 个自检套件、**600+ 断言**
 - 对外协议：CLI ｜ HTTP（含 SSE）｜ MCP（JSON-RPC 2.0）｜ Gradio Web ｜ Obsidian 插件
+- 演进计划：[docs/演进计划-视频分析策略与云端接入.md](docs/演进计划-视频分析策略与云端接入.md)
+  （D 包止血 / 云端接入 / 视频段理解通道 / 内容自适应管线 / 问答扩展）
 
 ---
 
@@ -105,7 +107,16 @@ zhiying doctor && zhiying analyze demo.mp4
 
 # 3) FFmpeg（不是 pip 包）
 winget install Gyan.FFmpeg        # 或把 bin 目录加到 PATH / 设 ZHIYING_FFMPEG_DIR
+
+# 4) 有 NVIDIA 显卡？一键切换 GPU 推理栈（无卡自动跳过）
+python scripts/setup_gpu.py        # 检测→装 CUDA 版 torch/运行库→验证；--check 只看不动
 ```
+
+> PyPI 默认轮子全是 CPU 构建 —— 机器有卡也全程跑 CPU 是"慢到离谱"的头号
+> 原因之一。`setup_gpu.py` 会如实报告 torch / llama-cpp-python / CTranslate2
+> 三层的实际状态；RTX 50 系（Blackwell）的 llama-cpp-python CUDA 版暂无
+> 预编译轮子，脚本会给出精确的源码编译命令。启动预检（preflight）发现
+> "有卡 + CPU 构建"时也会提示同一条命令。
 
 **模型权重不进 pip**，由 `ModelManager` 从 ModelScope（优先，国内快）→ HuggingFace
 （`HF_ENDPOINT` 镜像可配）自动下载，带进度条、断点续传、原子换入、manifest 校验：
@@ -244,9 +255,10 @@ python -m api.main                     # 界面 http://127.0.0.1:8000（根地�
 | GET | `/api/tasks/{id}` | 任务状态（stage / progress / report；重启后回落 SQLite 历史） |
 | GET | `/api/tasks/{id}/events` | **SSE** 进度流（带心跳） |
 | GET/POST | `/api/videos`、`/api/videos/{id}/ask` | 列表、问答 |
+| POST | `/api/videos/{id}/ask/stream` | **流式问答（SSE）**：meta→delta\*→final（final 为证据校验后定稿） |
 | GET | `/api/videos/{id}/keyframes/{kf}/image` | 关键帧图（按 ID 查库，不接受客户端路径） |
 | GET | `/api/videos/{id}/chapters` | 章节列表（`min_seconds`/`chapter_seconds`/`summarize`） |
-| GET | `/api/videos/{id}/chapters/report` | 章节总结的 markdown 报告 |
+| GET | `/api/videos/{id}/chapters/report` | **三层报告**：综合总结 → 内容驱动主要脉络 → 修字后详细解说词 |
 | DELETE | `/api/videos/{id}` | 删除视频 + 切片 + 关键帧 + 向量 |
 | POST | `/api/mcp` | MCP over HTTP |
 
@@ -283,7 +295,9 @@ python -m clients.gradio_ui            # http://127.0.0.1:7860
 ```
 
 五个页签：分析 / 视频库 / 时间线（切片表 + 关键帧画廊）/ 问答（回答 + 引用表）/
-状态（用量 + 配置摘要）。分析跑在后台线程，界面边跑边显示进度。
+状态（用量 + 配置摘要）。分析跑在后台线程，界面边跑边显示进度；**同一视频
+重复点"开始分析"会被直接拦截**（后端另有同视频串行锁兜底 —— 重复提交不会
+再触发第二条全量流水线互踩）。
 
 ### 5. Obsidian 插件
 
@@ -351,6 +365,26 @@ set ZH_YING__MODELS__DEVICE=cuda
 2. **云端视觉关掉就回本地**。`vl.cloud_enabled=false` 时走 `qwen2-vl-2b-gguf` + `mmproj`（CPU 上约 11.7 秒/帧）；打开则走 OpenAI 兼容协议，每轮最多 8 帧（`vl.cloud_sequence_frames`）—— 这个上限对本地是 4，因为 2B 模型超过 2 帧就开始编造画面内容。
 3. **"下载模型"和"加载模型"是两件事**。下载只落磁盘；`load_local` 勾上才会把权重读进内存（7B 在 CPU 上要等几分钟）。不勾则按需懒加载。
 
+**速度/精度换档**（改 `configs/app_config.yaml` 后重启，或经网页设置的本地模型区）：
+
+| 场景 | 改法 | 代价 |
+| --- | --- | --- |
+| 转写要快 | `asr.model: faster-whisper-medium`（或 `small`） | CER 上升，small 档明显 |
+| 本地 LLM 要快 | `llm.local.model: qwen3-4b-gguf` | 总结/问答质量略降，CPU 上快约一倍 |
+| 有 N 卡 | `python scripts/setup_gpu.py` | 一次性下载约 2-3 GB 的 CUDA 轮子 |
+
+**总结的篇幅**：分析期与"重新生成总结"走同一套"覆盖全片"预算（全部切片
+进上下文，上限 32 片，超出按位置铺开保首尾），提示词要求逐段时间段覆盖、
+总长不少于 400 字 —— 不会再用问答的 8 条预算把 5 分钟讲话压成三句话。
+超过 5 分钟（`min_seconds=300`，可调）的视频走章节摘要路径逐章细化。
+
+**导出报告是三层结构**（`export` / `/chapters/report`，改进 A/B）：
+`综合总结`（各章摘要再综合）→ `主要脉络`（逐章从素材挑真实时间节点，
+禁止 30s 均匀切分凑数）→ `详细解说词`（转写原文经 LLM 只修错字/标点、
+按章分节；LLM 不可用或输出异常短时保留原文）。长视频的报告字数主要由
+解说词承担 —— 1 小时讲解视频的报告轻松上万字。参数在 `report` 配置段
+（`polish_transcript` / `milestones_max_per_chapter` / `polish_block_chars`）。
+
 国内可用的 `base_url`（都是 OpenAI 兼容协议）：
 
 | 服务 | base_url | 视觉模型示例 |
@@ -390,12 +424,14 @@ set ZH_YING__MODELS__DEVICE=cuda
 | 引用误差 | ≤2s | 引用即切片边界，误差为 0 |
 | 单视频切片 | 200–500 | 40s 视频 2 片；1h 视频约 180 片 |
 | 切片长度 | 10–30s | 加权打分选点：`0.4·接近20s + 0.5·边界权重 − 0.1·超长` |
-| 问答首响应 | ≤10s | 检索 0–15ms + 上下文组装 + LLM |
+| 问答首响应 | ≤10s | 检索 0–15ms + 上下文组装 + LLM（流式端点已支持逐 token 输出） |
 | 前端响应 | ≤200ms | 列表/详情直查 SQLite，索引覆盖 |
 | 报告长度 | ≤5000 字符 | `export` 超限截断并注明 |
 | **中文转写 CER** | ≤15% | **1.1%**（TTS 语料 93 字，`scripts/eval_asr.py`） |
 | **英文转写 WER** | ≤20% | **7.4%**（TTS 语料 27 词，同上） |
 | 端到端冷启动 | — | 40s 视频 CPU：转写 15.6s（whisper-turbo）+ 抽帧 3.3s + 索引 22.7s（bge-m3 首次加载占大头）+ 其余 <2s |
+| CUDA 运行库缺失 | 不空转录 | 转写期探测到 cuBLAS/cuDNN 缺失 → 卸载重载 CPU 重试一次（D1） |
+| 高运动视频 | 视觉不复读 | 场景密度 ≥20/min：场景合并+每窗 1 帧（D3）；相似画面描述折叠（D2）；云端视频段通道整段理解（P1，`vl.video_mode`） |
 
 > 索引那 22.7s 里 ~20s 是 bge-m3 的权重加载。走 `serve` 常驻进程时只付一次；
 > CLI 是一次性进程，每次都重建，所以单次 `analyze` 会比服务模式慢一截。

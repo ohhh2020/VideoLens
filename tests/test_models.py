@@ -653,6 +653,67 @@ check("HashingEmbedder.embed_cross_texts 走图像维度", t_hash_cross_texts)
 
 
 # =============================================================================
+# D1：ASR 转写级 CPU 回退（cuBLAS 惰性加载，加载期探测不到，转写才炸）
+# =============================================================================
+
+print("\n[asr-d1] 转写级 CPU 回退")
+
+from types import SimpleNamespace as _SN  # noqa: E402
+
+from core.models.asr import AsrConfig, AsrEngine  # noqa: E402
+
+
+def t_asr_cpu_fallback() -> None:
+    engine = AsrEngine(AsrConfig(device="cuda"))
+    loads = {"n": 0}
+
+    class _CudaModel:
+        def transcribe(self, *a, **k):
+            raise RuntimeError(
+                "Library cublas64_12.dll is not found or cannot be loaded"
+            )
+
+    class _CpuModel:
+        def transcribe(self, *a, **k):
+            seg = _SN(text="CPU 转写成功的内容。", start=0.0, end=2.0, words=[])
+            info = _SN(language="zh", language_probability=1.0, duration=2.0)
+            return iter([seg]), info
+
+    cuda_model, cpu_model = _CudaModel(), _CpuModel()
+
+    def fake_load(*a, **k):
+        loads["n"] += 1
+        if engine._force_cpu:
+            engine._model, engine._loaded_key = cpu_model, ("p", "cpu", "int8")
+            return cpu_model
+        engine._model, engine._loaded_key = cuda_model, ("p", "cuda", "float16")
+        return cuda_model
+
+    engine.load = fake_load  # type: ignore[method-assign]
+    audio = Path(tmpdir) / "a.wav"
+    audio.write_bytes(b"RIFF----")
+    tr = engine._from_whisper(audio, video_id="vd1", duration_ms=2000, warnings=[])
+    assert tr.segments and tr.segments[0].text.startswith("CPU 转写成功"), tr.to_dict()
+    assert engine._force_cpu is True
+    assert engine.active_device[0] == "cpu", engine.active_device
+    assert any("回退" in w for w in tr.warnings), tr.warnings
+    assert loads["n"] == 2, f"应加载两次（cuda→cpu），实际 {loads['n']}"
+
+
+check("CUDA 转写炸→卸载重载 CPU 重试成功", t_asr_cpu_fallback)
+
+
+def t_asr_force_cpu_plan() -> None:
+    engine = AsrEngine(AsrConfig(device="cuda"))
+    engine._force_cpu = True
+    plan = engine._device_plan()
+    assert plan and all(d == "cpu" for d, _ in plan), plan
+
+
+check("force_cpu 后设备计划不再含 CUDA", t_asr_force_cpu_plan)
+
+
+# =============================================================================
 # 汇总
 # =============================================================================
 

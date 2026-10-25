@@ -210,6 +210,13 @@ class SceneDetectConfig:
     ffprobe_bin: str | None = None
     keep_probe_dir: bool = False
 
+    # -- ffmpeg 检测档加速（长视频默认路径，见 orchestrator._scene_boost）--
+    #: 用 NVDEC 硬解码（``-hwaccel cuda``）。失败自动回退软解，不中断。
+    ffmpeg_hwaccel: bool = False
+    #: ffmpeg scene 滤镜前先把画面缩到该宽度（0 = 不缩）。场景打分在
+    #: 480px 上足够可靠，1080p 全幅解码是纯浪费。
+    ffmpeg_detect_width: int = 0
+
     def resolved_ffmpeg(self) -> str:
         return self.ffmpeg_bin or _resolve_binary("ffmpeg")
 
@@ -694,26 +701,44 @@ class SceneDetector:
         return scenes
 
     def _detect_with_ffmpeg(self, info: ProbeInfo) -> list[Scene]:
-        """用 ffmpeg 的 ``scene`` 打分滤镜检测切点（PySceneDetect 缺失时的降级）。"""
+        """用 ffmpeg 的 ``scene`` 打分滤镜检测切点（PySceneDetect 缺失时的降级）。
+
+        ``ffmpeg_hwaccel`` 开启时先试 NVDEC 硬解（``-hwaccel cuda``，实测
+        10 倍实时），失败自动回退软解 —— 驱动/构建不支持时不能让检测
+        直接掉到"固定等分"那一档。
+        """
         scene_threshold = max(0.05, min(0.9, 0.35))
-        proc = self._run(
-            [
-                self._ffmpeg,
-                "-hide_banner",
-                "-nostdin",
-                "-loglevel",
-                "info",
-                "-i",
-                str(info.path),
-                "-an",
-                "-sn",
-                "-filter:v",
-                f"select='gt(scene\\,{scene_threshold})',metadata=print",
-                "-f",
-                "null",
-                "-",
-            ],
-        )
+        if self._cfg.ffmpeg_hwaccel:
+            try:
+                return self._run_ffmpeg_scene(info, scene_threshold, hwaccel=True)
+            except MediaError:
+                self._log.warning("NVDEC 硬解不可用，回退软解继续场景检测")
+        return self._run_ffmpeg_scene(info, scene_threshold, hwaccel=False)
+
+    def _run_ffmpeg_scene(
+        self, info: ProbeInfo, scene_threshold: float, *, hwaccel: bool
+    ) -> list[Scene]:
+        cmd: list[str] = [self._ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "info"]
+        if hwaccel:
+            # -hwaccel 必须在 -i 之前；解码在 GPU，滤镜/读帧仍在 CPU
+            cmd += ["-hwaccel", "cuda"]
+        filters: list[str] = []
+        if self._cfg.ffmpeg_detect_width > 0:
+            filters.append(f"scale={int(self._cfg.ffmpeg_detect_width)}:-2")
+        filters.append(f"select='gt(scene\\,{scene_threshold})'")
+        filters.append("metadata=print")
+        cmd += [
+            "-i",
+            str(info.path),
+            "-an",
+            "-sn",
+            "-filter:v",
+            ",".join(filters),
+            "-f",
+            "null",
+            "-",
+        ]
+        proc = self._run(cmd, timeout=max(self._cfg.timeout_s, 600.0))
         if proc.returncode != 0:
             raise MediaError(f"ffmpeg scene 滤镜失败: {self._stderr_text(proc)[:400]}")
         text = self._stderr_text(proc)

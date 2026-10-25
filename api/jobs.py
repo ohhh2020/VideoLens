@@ -189,15 +189,29 @@ class JobStore:
         )
         self._finished_count = 0
         self._max_jobs = max(10, int(max_jobs))
+        #: 规范化 source → 运行中 task_id。同一视频重复点"分析"时直接回传
+        #: 既有任务，而不是再排一条全量流水线（编排器层还有一道同视频锁兜底）。
+        self._inflight: dict[str, str] = {}
 
     # -- 提交 --------------------------------------------------------------- #
     def submit(self, orch: Orchestrator, source: str, options: AnalyzeOptions) -> JobState:
-        """登记任务并投递到线程池。抛 ``RuntimeError`` 表示线程池已关停。"""
-        task_id = f"t{uuid.uuid4().hex[:12]}"
-        job = JobState(task_id)
+        """登记任务并投递到线程池。抛 ``RuntimeError`` 表示线程池已关停。
+
+        同一 source 已有排队/运行中的任务时，**返回那个任务**（task_id 不变）——
+        调用方拿到的 202 与进度流都指向同一份执行，重复点击不会翻倍计算。
+        """
+        key = _source_key(source)
         with self._lock:
+            existing_id = self._inflight.get(key)
+            if existing_id:
+                existing = self._jobs.get(existing_id)
+                if existing is not None and existing.status in {"queued", "running"}:
+                    return existing
+            task_id = f"t{uuid.uuid4().hex[:12]}"
+            job = JobState(task_id)
             self._evict_locked()
             self._jobs[task_id] = job
+            self._inflight[key] = task_id
 
         # 同一个 task_id 传进编排器：SQLite tasks 表里的恢复记录与这里的
         # 进度流自此共用一个 ID，MCP get_task / HTTP /tasks/{id} 都能查到。
@@ -226,7 +240,7 @@ class JobStore:
                 job.finish(None, error=f"{type(exc).__name__}: {exc}")
             else:
                 job.finish(report)
-            self._persist_finish(orch, job)
+            self._persist_finish(orch, job, source_key=key)
 
         self._executor.submit(work)  # shutdown 后 submit 抛 RuntimeError，交给调用方转 503
         return job
@@ -304,9 +318,14 @@ class JobStore:
         except StorageError:
             logger.debug("任务心跳落库失败 %s", job.task_id, exc_info=True)
 
-    def _persist_finish(self, orch: Orchestrator, job: JobState) -> None:
+    def _persist_finish(self, orch: Orchestrator, job: JobState, source_key: str | None = None) -> None:
         snapshot = job.snapshot()
         status = "done" if snapshot["status"] == "done" else "failed"
+        if source_key:
+            with self._lock:
+                # 只在仍指向本任务时清掉（防极小概率的 ABA 覆盖）
+                if self._inflight.get(source_key) == job.task_id:
+                    self._inflight.pop(source_key, None)
         try:
             orch.repository.upsert_task(
                 snapshot.get("video_id") or "",
@@ -329,6 +348,11 @@ class JobStore:
                 orch.repository.prune_finished_tasks(keep=PRUNE_KEEP)
             except Exception:  # noqa: BLE001
                 logger.debug("任务表裁剪失败", exc_info=True)
+
+
+def _source_key(source: str) -> str:
+    """同源判定键：去空白 + 小写。URL 参数顺序不同视为不同源（宁可多跑不误判）。"""
+    return " ".join(str(source or "").split()).lower()
 
 
 # --------------------------------------------------------------------------- #

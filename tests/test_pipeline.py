@@ -276,6 +276,200 @@ def main() -> int:
     check("进度单调非减", all(events[i][1] <= events[i + 1][1] + 1e-9 for i in range(len(events) - 1)))
     check("总结非空", bool(report.summary.strip()))
 
+    print("\n=== 1b. 同视频并发提交只算一遍 ===")
+    # 复现线上事故：用户把同一个视频点了两次，两条全量流水线互踩。
+    # 期望：第二条等第一条完成后走"已分析完成"快路径，ASR 只多跑一次。
+    vid = report.video_id
+    orch.delete(vid)
+    parts["asr"].calls = 0
+    results: dict[int, Any] = {}
+    barrier = threading.Barrier(2)
+
+    def _worker(idx: int) -> None:
+        barrier.wait()  # 两线程同时冲进来，制造真实竞态
+        results[idx] = orch.analyze(str(DEMO), AnalyzeOptions())
+
+    threads = [threading.Thread(target=_worker, args=(i,)) for i in (1, 2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=180)
+    check("两个提交都完成", all(results.get(i) for i in (1, 2)), sorted(results))
+    check("两个都 ready", all(r.status == "ready" for r in results.values()),
+          [r.status for r in results.values()])
+    check("ASR 只跑一遍（重复被串行化）", parts["asr"].calls == 1, parts["asr"].calls)
+    check("其一报告排队/复用说明",
+          any("排队等待" in w or "已完成" in w or "复用" in w
+              for r in results.values() for w in r.warnings + [s.message for s in r.stages]),
+          [r.warnings for r in results.values()])
+
+    print("\n=== 1c. 总结预算覆盖全片 ===")
+    module = _orchestrator_module()
+    budget16 = module._summary_budget(16)
+    check("16 片预算上限 ≥16", budget16.max_items >= 16, budget16.max_items)
+    check("短视频保底 12 条", module._summary_budget(2).max_items >= 12,
+          module._summary_budget(2).max_items)
+    payloads16 = [
+        {"clip_id": f"c{i:04d}", "video_id": "vb", "index_no": i,
+         "start_ms": i * 20_000, "end_ms": i * 20_000 + 19_000,
+         "text": f"第{i}段内容 " + "讲" * 60, "core_text": f"第{i}段核心 " + "讲" * 60}
+        for i in range(16)
+    ]
+    from core.pipeline import ContextBuilder as _CB
+
+    built16 = _CB(budget16).build_summary(
+        payloads16, video_title="预算验证", duration_ms=320_000
+    )
+    check("build_summary 全量入选 16/16", len(built16.items) == 16, len(built16.items))
+    check("旧 8 条上限不再截断", len(built16.items) > 8, len(built16.items))
+    first_ids = {p["clip_id"] for p in payloads16}
+    check("首尾片段都在上下文",
+          payloads16[0]["clip_id"] in {i.clip_id for i in built16.items}
+          and payloads16[-1]["clip_id"] in {i.clip_id for i in built16.items})
+
+    print("\n=== 1d. JobStore 同源去重 ===")
+    from api.jobs import JobStore  # noqa: PLC0415
+    from core.pipeline import AnalysisReport  # noqa: PLC0415
+    from types import SimpleNamespace as _NS
+
+    release = threading.Event()
+    started_flag = threading.Event()
+
+    class _StubRepo:
+        def upsert_task(self, *a: Any, **k: Any) -> str:
+            return k.get("task_id") or "t-stub"
+
+        def update_task(self, *a: Any, **k: Any) -> None:
+            return None
+
+        def prune_finished_tasks(self, **k: Any) -> int:
+            return 0
+
+    class _StubOrch:
+        repository = _StubRepo()
+
+        def analyze(self, source: str, options: Any) -> Any:
+            started_flag.set()
+            release.wait(timeout=30)  # 卡住任务，制造"运行中"窗口
+            return AnalysisReport(video_id="vdup", status="ready", title="去重验证")
+
+    store = JobStore(max_workers=2)
+    try:
+        job1 = store.submit(_StubOrch(), "D:/dup/video.mp4", AnalyzeOptions())
+        check("首个任务已启动", started_flag.wait(timeout=5))
+        job2 = store.submit(_StubOrch(), "D:/dup/video.mp4", AnalyzeOptions())
+        check("重复提交回传同一 task_id", job2.task_id == job1.task_id,
+              (job1.task_id, job2.task_id))
+        job3 = store.submit(_StubOrch(), "D:/other/video.mp4", AnalyzeOptions())
+        check("不同源是新任务", job3.task_id != job1.task_id)
+        release.set()
+        final = store.wait(job1, timeout_s=15)
+        check("任务正常完成", final.get("status") == "done", final.get("status"))
+    finally:
+        release.set()
+        store.shutdown(wait=False)
+
+    print("\n=== 1e. 视觉描述去重折叠（D2） ===")
+    # 运动类视频的病灶：14 段画面描述几乎全同 → 总结复读。折叠后首段保留
+    # 全文，相似段（bigram-Dice ≥ 0.75）只留时间跨度 + "与前段类似"。
+    class _StubKfRepo:
+        def __init__(self, kfs: list[Any]) -> None:
+            self._kfs = kfs
+
+        def get_keyframes(self, video_id: str) -> list[Any]:
+            return self._kfs
+
+    same_desc = "球员在场上奔跑和传球，攻防转换不断。"
+    kfs = [
+        SimpleNamespace(keyframe_id=f"k{i}", description=same_desc, ocr_text="",
+                        timestamp_ms=i * 20_000)
+        for i in range(3)
+    ]
+    stub_items = [
+        {"clip_id": f"c{i}", "text": f"第{i}段转录", "keyframe_ids": [f"k{i}"]}
+        for i in range(3)
+    ]
+    real_repo = orch.repository
+    try:
+        orch._repo = _StubKfRepo(kfs)
+        enriched = orch._attach_visuals("vx", [dict(it) for it in stub_items])
+    finally:
+        orch._repo = real_repo
+    full_hits = sum("球员在场上奔跑" in (it.get("text") or "") for it in enriched)
+    collapsed = sum("画面与前段类似" in (it.get("text") or "") for it in enriched)
+    check("首段保留全文（只出现一次）", full_hits == 1, full_hits)
+    check("后两段折叠", collapsed == 2, collapsed)
+    check("折叠段仍带时间跨度", all("【画面" in (it.get("text") or "") for it in enriched))
+
+    print("\n=== 1f. 长视频场景检测加速档（D4/Tier2） ===")
+    check("5 分钟以上给 pyscedetect 加速档 (2,4)", orch._scene_boost(400_000) == (2, 4),
+          orch._scene_boost(400_000))
+    check("短视频不加速", orch._scene_boost(100_000) is None, orch._scene_boost(100_000))
+    boosted = orch._long_video_detector()
+    check("长视频默认走 ffmpeg 硬解档",
+          boosted is not None and boosted.config.detector == "ffmpeg"
+          and boosted.config.ffmpeg_hwaccel and boosted.config.ffmpeg_detect_width == 480,
+          boosted.config if boosted is not None else None)
+    check("ffmpeg 硬解可关（回退跳帧档）",
+          orch._scene_detector_with(detector="ffmpeg", ffmpeg_hwaccel=False).config.ffmpeg_hwaccel is False)
+
+    print("\n=== 1g. 视频段理解通道（P1） ===")
+    from core.config import load_app_config as _lac2
+
+    cfg2 = _lac2(
+        root=str(ROOT),
+        overrides={
+            "paths.audio": str(WORK / "audio"),
+            "paths.frames": str(WORK / "frames"),
+            "paths.sqlite": str(WORK / "zhiying.db"),
+            "paths.chroma": str(WORK / "chroma"),
+            "vl.video_mode": "segments",
+        },
+    )
+    orch2, parts2 = build(cfg2)
+    orch2._scene = SceneDetector(SceneDetectConfig(frames_per_scene=2, min_frames_per_scene=1))
+
+    class FakeSegVl:
+        def __init__(self) -> None:
+            self.segment_calls: list[tuple[int, int]] = []
+
+        @property
+        def supports_video_segments(self) -> bool:
+            return True
+
+        @property
+        def is_cloud(self) -> bool:
+            return True
+
+        def describe_video_segment(self, path: Any, start_ms: int, end_ms: int) -> Any:
+            self.segment_calls.append((start_ms, end_ms))
+            return SimpleNamespace(
+                description=f"【段】{start_ms // 1000}-{end_ms // 1000}s 的比赛攻防",
+                ocr_text="画面字幕X", degraded=False, error="",
+            )
+
+        def describe(self, image_path: Any, **kw: Any) -> Any:
+            return SimpleNamespace(description="帧回退描述", ocr_text="",
+                                   degraded=False, error="")
+
+        def describe_sequence(self, frames: Any, **kw: Any) -> Any:
+            return SimpleNamespace(description="帧回退描述", ocr_text="",
+                                   degraded=False, error="")
+
+    seg_vl = FakeSegVl()
+    parts2["vl"] = seg_vl
+    orch2._vl = seg_vl
+    rep2 = orch2.analyze(str(DEMO), AnalyzeOptions(force=True))
+    check("段模式分析成功", rep2.status == "ready", rep2.status)
+    check("vision_mode_used=segments", rep2.profile.get("vision_mode_used") == "segments",
+          rep2.profile)
+    check("段调用 >=1", len(seg_vl.segment_calls) >= 1, seg_vl.segment_calls)
+    desc_list = [str(k.description or "") for k in parts2["repo"].get_keyframes(rep2.video_id)]
+    check("关键帧描述来自视频段", any(d.startswith("【段】") for d in desc_list), desc_list[:3])
+    check("画像含场景密度", "scene_density_per_min" in rep2.profile, rep2.profile)
+    check("画像含语音占比", "speech_ratio" in rep2.profile, rep2.profile)
+    orch2.close()
+
     print("\n=== 2. 数据库落盘 ===")
     repo = parts["repo"]
     vid = report.video_id
@@ -304,10 +498,13 @@ def main() -> int:
     check("frame 向量数一致", active.count("frame") == len(keyframes), active.count("frame"))
     check("基础集合未被写入", vectors.count("clip") == 0, vectors.count("clip"))
 
-    print("\n=== 4. ask ===")
+    print("\n=== 4. ask（多轮） ===")
+    from core.pipeline.chat_sessions import get_chat_store
+    get_chat_store().clear(vid)
     ans = orch.ask(vid, "切片长度是怎么定的")
     print("answer:", ans.answer)
     print("refs:", [r.to_dict() for r in ans.refs])
+    calls_after_first = len(parts["llm"].calls)
     check("有回答", bool(ans.answer.strip()))
     check("有引用", len(ans.refs) >= 1, len(ans.refs))
     check("引用带 clip_id", all(r.clip_id for r in ans.refs))
@@ -323,9 +520,86 @@ def main() -> int:
     payload = ans.to_dict()
     blob = json.dumps(payload, ensure_ascii=False)
     check("AskResult JSON 可序列化", len(blob) > 50, f"{len(blob)} 字节")
-    check("LLM 收到上下文", len(parts["llm"].calls) >= 2, len(parts["llm"].calls))
+    check("LLM 收到上下文", calls_after_first >= 1, calls_after_first)
     check("引用带原文", all(r.text for r in ans.refs) or ans.refs[0].text == "",
           [len(r.text) for r in ans.refs])
+
+    # 多轮：第二轮追问应带历史前缀并被记忆（FakeLlm 不分流改写提示词，
+    # 改写输出=默认文本与原问不同 → 检索用改写查询；这里验证机制而非语义）
+    ans2 = orch.ask(vid, "那重叠是多少呢")
+    store = get_chat_store()
+    history = store.history(vid)
+    check("第二轮有回答", bool(ans2.answer.strip()))
+    check("会话记忆两轮", len(history) == 4, len(history))
+    check("历史含首问", any(m.get("content") == "切片长度是怎么定的" for m in history))
+    check("追问被改写记录", store.last_answer(vid) == ans2.answer)
+    get_chat_store().clear(vid)
+
+    print("\n=== 4b. 三层报告（改进 A/B） ===")
+    import re as _re
+
+    class _RoutingFakeLlm:
+        """按提示词内容分流的假 LLM：修字/脉络/综合各回固定格式的答案。"""
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def complete(self, messages: Any, **kw: Any) -> Any:
+            content = str(messages[-1].get("content") if isinstance(messages[-1], dict)
+                          else messages[-1])
+            self.calls.append(content[:24])
+            if "修正错别字" in content or "只做两件事" in content:
+                return SimpleNamespace(
+                    text="第一段讲的是视频解析与音频抽取。第二段说明切片长度默认十到三十秒。",
+                    backend="fake", degraded=False,
+                )
+            if "最关键的节点" in content or "HH:MM:SS" in content:
+                return SimpleNamespace(
+                    text="00:00:08 讲解视频解析流程\n00:00:20 切片长度规则\n99:59:00 超界行应被丢弃",
+                    backend="fake", degraded=False,
+                )
+            if "综合总结" in content:
+                return SimpleNamespace(
+                    text="## 内容概览\n综合概览文字足够长" * 8,
+                    backend="fake", degraded=False,
+                )
+            return SimpleNamespace(text="根据 [1]，默认回答。", backend="fake", degraded=False)
+
+    routing_llm = _RoutingFakeLlm()
+    saved_llm = orch._llm
+    orch._llm = routing_llm
+    try:
+        report_md = orch.full_report(vid, min_seconds=0, chapter_seconds=10)
+    finally:
+        orch._llm = saved_llm
+    check("报告含三层标题",
+          all(h in report_md for h in ("## 综合总结", "## 主要脉络", "## 详细解说词")),
+          [h for h in ("## 综合总结", "## 主要脉络", "## 详细解说词") if h not in report_md])
+    milestones = _re.findall(r"- \*\*(\d{2}:\d{2}:\d{2})\*\* (\S+)", report_md)
+    check("脉络来自内容节点（非 30s 网格）",
+          len(milestones) >= 2 and any(m[0] == "00:00:08" for m in milestones),
+          milestones)
+    check("超界时间被丢弃", not any(m[0].startswith("99") for m in milestones), milestones)
+    check("解说词含修正文本", "切片长度默认十到三十秒" in report_md)
+    check("解说词分章节标头", "### " in report_md)
+    check("分流调用发生（修字/脉络/综合）", len(routing_llm.calls) >= 3, routing_llm.calls)
+    # 修字违约保护：输出明显短于输入一半时保留原文
+    class _LazyLlm:
+        def complete(self, messages: Any, **kw: Any) -> Any:
+            content = str(messages[-1].get("content") if isinstance(messages[-1], dict)
+                          else messages[-1])
+            if "只做两件事" in content or "修正错别字" in content:
+                return SimpleNamespace(text="太短的修字输出", backend="lazy", degraded=False)
+            if "最关键的节点" in content or "HH:MM:SS" in content:
+                return SimpleNamespace(text="", backend="lazy", degraded=False)
+            return SimpleNamespace(text="综合", backend="lazy", degraded=False)
+
+    orch._llm = _LazyLlm()
+    try:
+        guarded = orch.full_report(vid, min_seconds=0, chapter_seconds=10)
+    finally:
+        orch._llm = saved_llm
+    check("修字输出过短退回原文", "第一段讲的是视频解析与音频抽取" in guarded)
 
     print("\n=== 5. ask 边界 ===")
     empty = orch.ask(vid, "   ")

@@ -32,7 +32,7 @@ import threading
 import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Any, Final, Iterator, Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import (
@@ -114,6 +114,7 @@ class AskRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=500, description="问题（≤500 字符）")
     top_k: int | None = Field(None, ge=1, le=50, description="检索条数，默认取配置")
     max_context_tokens: int | None = Field(None, ge=512, le=32_000)
+    session_id: str = Field("", max_length=64, description="会话分组（/chat 页每段对话一个；留空归 legacy）")
 
     @field_validator("question")
     @classmethod
@@ -821,12 +822,53 @@ def create_router(cfg: AppConfig | None = None) -> APIRouter:
                 payload.question,
                 top_k=payload.top_k,
                 max_context_tokens=payload.max_context_tokens,
+                session_id=payload.session_id,
             )
         except PipelineError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         if not result.answer and any("视频不存在" in note for note in result.notes):
             raise HTTPException(status_code=404, detail=f"视频不存在: {video_id}")
         return _answer_out(result)
+
+    @router.post(
+        "/videos/{video_id}/ask/stream",
+        tags=["qa"],
+        summary="流式问答（SSE：meta → delta* → final；final 为证据校验后的定稿）",
+        dependencies=[auth],
+    )
+    def ask_stream_sse(
+        request: Request, video_id: str, payload: AskRequest = Body(...)
+    ) -> StreamingResponse:
+        orch = _orchestrator(request)
+
+        def gen() -> Iterator[str]:
+            try:
+                for kind, data in orch.ask_stream(
+                    video_id,
+                    payload.question,
+                    top_k=payload.top_k,
+                    max_context_tokens=payload.max_context_tokens,
+                    session_id=payload.session_id,
+                ):
+                    if kind == "final":
+                        yield _sse({"type": "final", "result": data.to_dict()})
+                    else:
+                        yield _sse({"type": kind, "data": data})
+            except PipelineError as exc:
+                yield _sse({"type": "error", "message": str(exc)})
+            except Exception as exc:  # noqa: BLE001 - SSE 不能半路变 500
+                logger.exception("流式问答失败")
+                yield _sse({"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @router.post(
         "/videos/{video_id}/summary",
@@ -863,7 +905,7 @@ def create_router(cfg: AppConfig | None = None) -> APIRouter:
         video_id: str,
         chapter_seconds: int = 300,
         max_chapters: int = 40,
-        min_seconds: int = 600,
+        min_seconds: int = 300,
         summarize: bool = True,
     ) -> dict[str, Any]:
         orch = _orchestrator(request)
@@ -899,7 +941,7 @@ def create_router(cfg: AppConfig | None = None) -> APIRouter:
         request: Request,
         video_id: str,
         chapter_seconds: int = 300,
-        min_seconds: int = 600,
+        min_seconds: int = 300,
     ) -> PlainTextResponse:
         orch = _orchestrator(request)
         try:

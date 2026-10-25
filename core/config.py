@@ -59,6 +59,8 @@ __all__ = [
     "DownloadSection",
     "EmbeddingSection",
     "GradioSection",
+    "ReportSection",
+    "QaSection",
     "KeyframeSection",
     "LimitsSection",
     "LlmSection",
@@ -175,6 +177,10 @@ class DownloadSection:
     resume: bool = True
     cookies_from_browser: str | None = None
     max_url_length: int = 2048
+    #: 下载源的最高分辨率。分析链路对清晰度的真实需求：关键帧目标短边 720
+    #: （只缩不放）、视觉模型输入 448px、场景检测还会再降采样 —— 1080p 源
+    #: 只是让下载多花两三倍时间。720p 同时也是 B 站免登录可得的最高档。
+    format_max_height: int = 720
 
     def validate(self) -> None:
         if self.max_retries < 0:
@@ -185,6 +191,9 @@ class DownloadSection:
             )
         if self.max_url_length < 1:
             raise ConfigValueError("media.download.max_url_length", ">= 1", self.max_url_length)
+        if self.format_max_height < 144:
+            raise ConfigValueError("media.download.format_max_height", ">= 144",
+                                   self.format_max_height)
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,6 +240,17 @@ class SceneSection:
     dedupe_grid: int = 4
     max_workers: int = 4
     keep_probe_dir: bool = False
+    # ---- 长视频检测加速（D4）----
+    # 时长超过该值的视频，检测时提高 frame_skip/downscale（切点精度略降，
+    # 换取"检测耗时不超过视频时长"）。0 = 关闭。
+    long_video_min_ms: int = 300_000
+    long_video_frame_skip: int = 2
+    long_video_downscale: int = 4
+    # 长视频改走 ffmpeg 检测档：NVDEC 硬解 + 480px 降采样打分（实测比
+    # PySceneDetect 逐帧软解快一个量级）。false 则维持 pyscedetect 加速档。
+    long_video_use_ffmpeg: bool = True
+    long_video_hwaccel: bool = True
+    long_video_detect_width: int = 480
     keyframe: KeyframeSection = field(default_factory=KeyframeSection)
 
     def validate(self) -> None:
@@ -334,6 +354,17 @@ class VlSection:
     cloud_max_retries: int = 1
     # 云端没这个限制（2B 模型的毛病），放宽到 8；本地仍锁 1..4
     cloud_sequence_frames: int = 8
+    # ---- 视频段理解（云端 qwen-vl 直接吃短视频段，见 docs/演进计划）----
+    #: auto=按场景密度分派（讲解→帧，运动→段）；frames=只用抽帧；segments=只用分段
+    video_mode: str = "auto"
+    #: 单段时长上限（秒）：超出按此再剪；也决定上传体积（480p 重编码后约 1~5MB）
+    video_segment_max_s: int = 15
+    #: 每视频最多走"段"的场景数（费用闸门），超出退回抽帧
+    video_segment_budget: int = 40
+    #: 场景密度超过该值（次/分钟）判为高运动视频：auto 下走段/降档
+    high_motion_density_per_min: float = 20.0
+    #: 高运动降档时把相邻场景合并到该跨度（毫秒）再抽帧，减少视觉调用量
+    high_motion_scene_span_ms: int = 10_000
 
     def validate(self) -> None:
         if self.max_new_tokens < 1:
@@ -350,6 +381,18 @@ class VlSection:
         if self.cloud_enabled and not self.cloud_model:
             raise ConfigValueError("vl.cloud_model", "非空（cloud_enabled=true 时）",
                                    self.cloud_model)
+        if self.video_mode not in {"auto", "frames", "segments"}:
+            raise ConfigValueError("vl.video_mode", "auto|frames|segments", self.video_mode)
+        if not 5 <= self.video_segment_max_s <= 60:
+            raise ConfigValueError("vl.video_segment_max_s", "5..60", self.video_segment_max_s)
+        if self.video_segment_budget < 1:
+            raise ConfigValueError("vl.video_segment_budget", ">= 1", self.video_segment_budget)
+        if self.high_motion_density_per_min <= 0:
+            raise ConfigValueError("vl.high_motion_density_per_min", "> 0",
+                                   self.high_motion_density_per_min)
+        if self.high_motion_scene_span_ms < 2_000:
+            raise ConfigValueError("vl.high_motion_scene_span_ms", ">= 2000",
+                                   self.high_motion_scene_span_ms)
 
 
 @dataclass(frozen=True, slots=True)
@@ -711,6 +754,42 @@ class TargetsSection:
 
 
 @dataclass(frozen=True, slots=True)
+class QaSection:
+    """多轮问答（C 端对话形态，见 core/pipeline/chat_sessions.py）。"""
+
+    #: 多轮：把最近几轮问答作为 LLM 前缀。关掉即退回单轮问答。
+    multi_turn: bool = True
+    #: 查询改写：检索前把"那第二个进球呢"这类追问扩写成独立完整查询。
+    query_rewrite: bool = True
+    #: 每视频保留的对话轮数（内存 LRU，进程重启即清）。
+    history_window: int = 8
+
+    def validate(self) -> None:
+        if self.history_window < 1:
+            raise ConfigValueError("qa.history_window", ">= 1", self.history_window)
+
+
+@dataclass(frozen=True, slots=True)
+class ReportSection:
+    """三层报告（改进 A/B）：综合总结 / 内容驱动的脉络 / 修字后的解说词。"""
+
+    #: LLM 修正转写错字（保留原话，不增删）。False 时解说词直接用原文。
+    polish_transcript: bool = True
+    #: 每章最多提取的关键节点数（改进 B：内容驱动，禁止均匀切分）
+    milestones_max_per_chapter: int = 5
+    #: 单次送 LLM 修字的最大转写长度（字符），超出按章内再分块
+    polish_block_chars: int = 4_000
+
+    def validate(self) -> None:
+        if self.milestones_max_per_chapter < 1:
+            raise ConfigValueError("report.milestones_max_per_chapter", ">= 1",
+                                   self.milestones_max_per_chapter)
+        if self.polish_block_chars < 500:
+            raise ConfigValueError("report.polish_block_chars", ">= 500",
+                                   self.polish_block_chars)
+
+
+@dataclass(frozen=True, slots=True)
 class LoggingSection:
     level: str = "INFO"
     format: str = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
@@ -752,6 +831,8 @@ class AppConfig:
     api: ApiSection = field(default_factory=ApiSection)
     mcp: McpSection = field(default_factory=McpSection)
     gradio: GradioSection = field(default_factory=GradioSection)
+    report: ReportSection = field(default_factory=ReportSection)
+    qa: QaSection = field(default_factory=QaSection)
     limits: LimitsSection = field(default_factory=LimitsSection)
     targets: TargetsSection = field(default_factory=TargetsSection)
     logging: LoggingSection = field(default_factory=LoggingSection)
@@ -805,6 +886,8 @@ class AppConfig:
         self.api.validate()
         self.mcp.validate()
         self.gradio.validate()
+        self.report.validate()
+        self.qa.validate()
         self.limits.validate()
         self.logging.validate()
 

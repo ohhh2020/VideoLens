@@ -148,19 +148,40 @@ class DownloadConfig:
 
     @classmethod
     def from_config(cls, config: Any) -> DownloadConfig:
-        """从 :class:`core.config.AppConfig` 构造。"""
+        """从 :class:`core.config.AppConfig` 构造。
+
+        路径必须走 ``cfg.path()`` 拿**绝对路径**。直接取 ``paths.videos`` 的
+        相对字符串时，yt-dlp 会把相对的 ``data/videos`` 解析到 ``paths`` 基准
+        目录之下，产出 ``data\\temp\\data\\videos\\...`` 这种双重路径 ——
+        实测触发 FileNotFoundError 与四轮退避重试，纯浪费一两分钟。
+        """
         media = getattr(config, "media", None)
         download = getattr(media, "download", None)
         paths = getattr(config, "paths", None)
+        resolve = getattr(config, "path", None)
+        if callable(resolve):
+            videos = Path(resolve("videos"))
+            temp = Path(resolve("temp"))
+        else:  # 裸配置对象（部分单测）：退回字符串并按项目根解析
+            root = Path(getattr(config, "root_dir", Path.cwd()))
+            videos = (root / str(getattr(paths, "videos", "data/videos"))).resolve()
+            temp = (root / str(getattr(paths, "temp", "data/temp"))).resolve()
         limits = getattr(config, "limits", None)
-        videos = Path(str(getattr(paths, "videos", "data/videos")))
-        temp = Path(str(getattr(paths, "temp", "data/temp")))
         kwargs: dict[str, Any] = {
             "videos_dir": videos,
             "temp_dir": temp,
             "max_file_bytes": getattr(limits, "max_file_bytes", None),
             "max_duration_ms": getattr(limits, "max_duration_ms", None),
         }
+        # 下载源分辨率上限（默认 720p）：分析链路真实需求只有关键帧 720 短边
+        # 与视觉模型 448px，1080p 源只是白付两三倍下载时间。
+        max_h = getattr(download, "format_max_height", None)
+        if max_h:
+            h = max(144, int(max_h))
+            kwargs["format_selector"] = (
+                f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/"
+                f"bv*[height<={h}]+ba/b[height<={h}]/b"
+            )
         for src, dst in (
             ("max_retries", "max_retries"),
             ("backoff_base", "backoff_base"),

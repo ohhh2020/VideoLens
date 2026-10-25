@@ -249,3 +249,35 @@ models:
     ignore_patterns: ["*.md", "*.png", ".gitattributes"]
     required_files:
       - "*q4_k_m*.gguf"
+
+  # -------------------------------------------------------------------------
+  # 6b) 文本生成（速度优先档）：Qwen3-4B
+  #     吸收自旧版 VideoLens 的实践：4B 的 Q4_K_M 在 CPU 上比 7B 快约一倍，
+  #     总结/问答质量略降但可用；纯 CPU 机器建议切到这档：
+  #       llm.local.model: qwen3-4b-gguf
+  #     （app_config.yaml 对应注释同步。默认仍是 7B —— 已下载过 7B 的用户
+  #     不应被静默触发 2.5GB 下载。）
+  # -------------------------------------------------------------------------
+  qwen3-4b-gguf:
+    kind: "text-llm"
+    required: false
+    license: "Apache-2.0"
+    description: "Qwen3-4B GGUF（Q4_K_M），速度优先档：CPU 上比 7B 快约一倍"
+    size_hint_gb: 2.5
+    targets:
+      llm: "llama.cpp"
+    sources:
+      modelscope:
+        repo_id: "Qwen/Qwen3-4B-GGUF"
+        revision: "master"
+      huggingface:
+        repo_id: "Qwen/Qwen3-4B-GGUF"
+        revision: "main"
+    # 单文件 Qwen3-4B-Q4_K_M.gguf（约 2.4GB）；模式小写以兼容大小写敏感的源
+    allow_patterns:
+      - "*Q4_K_M*"
+      - "*q4_k_m*"
+      - "*.json"
+    ignore_patterns: ["*.md", "*.png", ".gitattributes"]
+    required_files:
+      - "*4_K_M*.gguf"

@@ -114,9 +114,9 @@ def create_app(
         orchestrator: 直接注入编排器（测试用，跳过重量级装配）。
         load_models: 为 ``False`` 时只装配轻量组件（不下载/加载权重），
             供无模型环境做接口联调。
-        serve_ui: 是否把 Gradio 界面挂到 ``/ui``。``None`` 时读
-            ``api.serve_ui``。挂载会 import gradio（连带 transformers 等），
-            因此模块级 ``app`` 显式关闭，只有 ``python -m api.main`` 打开。
+        serve_ui: 是否启用原生工作台（``/ui`` 单页 + 根路径重定向）。``None`` 时
+            读 ``api.serve_ui``。``/ui`` 是零依赖静态页，模块级 ``app`` 仍显式
+            关闭（uvicorn CLI 形态按纯 API 使用）。
     """
     config = cfg or load_app_config()
     configure_logging(config)
@@ -185,6 +185,13 @@ def create_app(
     application.include_router(create_router(config), prefix="/api")
     # MCP over HTTP：与 REST 共用鉴权与编排器，路径 /api/mcp（Obsidian/远程客户端用）。
     application.include_router(create_http_router(), prefix="/api")
+    # 原生单页：/ui 分析工作台（Gradio 已从主路径退役——iframe 沙箱拦导航、
+    # theme/css API 变迁，原生栈与 /chat 同源且导航互通）。
+    from api.chat_page import create_chat_router  # noqa: PLC0415
+    from api.ui_page import create_ui_router  # noqa: PLC0415
+
+    application.include_router(create_chat_router(config))
+    application.include_router(create_ui_router(config))
 
     @application.get("/", include_in_schema=False)
     def index() -> Any:
@@ -202,7 +209,7 @@ def create_app(
             "version": str(config.app.version),
         }
 
-    application.state.ui_path = _mount_ui(application, config) if with_ui else ""
+    application.state.ui_path = "/ui" if with_ui else ""
 
     return application
 
@@ -213,7 +220,7 @@ def _build_orchestrator(cfg: AppConfig, load_models: bool) -> Orchestrator:
 
 
 # =============================================================================
-# 内嵌 Web 界面
+# 兜底落地页（/ui 或 /chat 路由缺失时才会被看到；正常路径根地址直接重定向 /ui）
 # =============================================================================
 
 _LANDING_HTML = """<!doctype html>
@@ -228,64 +235,17 @@ _LANDING_HTML = """<!doctype html>
   a{display:block;padding:11px 14px;margin:8px 0;border:1px solid #2e3542;border-radius:9px;
     color:#e6e8ee;text-decoration:none;transition:.15s}
   a:hover{border-color:#4f7cff;background:#1d2330}
-  code{color:#9db4ff;font-family:ui-monospace,Consolas,monospace}
-  .warn{margin-top:18px;padding:10px 12px;background:#2a2113;border:1px solid #4a3a17;
-        border-radius:8px;color:#e8c97a;font-size:13px}
+  a.primary{background:#4f7cff;border-color:#4f7cff;color:#fff;font-weight:600}
+  a.primary:hover{filter:brightness(1.1)}
 </style></head><body>
 <div class="card">
   <h1>知影 ZhiYing</h1>
   <p class="sub">本地优先的视频智能分析服务</p>
-  <a href="http://127.0.0.1:7860">→ 打开独立 Web 界面（7860，需另起 python -m clients.gradio_ui）</a>
+  <a class="primary" href="/ui">🛠️ 分析工作台</a>
+  <a href="/chat">💬 视频对话 —— 对已入库视频随时提问（带引用跳转）</a>
   <a href="/docs">→ REST API 文档（Swagger）</a>
-  <a href="/api/health">→ 服务健康检查</a>
-  <div class="warn">Web 界面未挂载。用 <code>python -m api.main</code> 或 <code>start.bat web</code>
-  启动，界面会出现在本地址；也可单独运行 <code>python -m clients.gradio_ui</code>（7860 端口）。</div>
 </div></body></html>
 """
-
-
-class _OrchestratorProxy:
-    """把界面侧的编排器调用转发到 lifespan 里才装配好的实例。
-
-    界面必须在 ``create_app`` 时就建好（Gradio 的路由要一次性挂载），
-    而真正的编排器在启动钩子里才装配 —— 中间这段时间用代理顶住，
-    调用到达时才取实例，避免出现"界面在、模型没装配"的假成功。
-    """
-
-    def __init__(self, application: FastAPI) -> None:
-        self._app = application
-
-    @property
-    def config(self) -> AppConfig:
-        return self._app.state.config
-
-    def _target(self) -> Any:
-        orch = getattr(self._app.state, "orchestrator", None)
-        if orch is None:
-            reason = getattr(self._app.state, "assembly_error", "") or "正在启动"
-            raise RuntimeError(f"分析引擎尚未就绪：{reason}")
-        return orch
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._target(), name)
-
-
-def _mount_ui(application: FastAPI, config: AppConfig) -> str:
-    """把 Gradio 界面挂到 ``/ui``，返回挂载路径；失败返回空串（不影响 API）。"""
-    try:
-        import gradio as gr  # noqa: PLC0415
-        from clients.gradio_ui import build_ui  # noqa: PLC0415
-    except Exception as exc:  # noqa: BLE001 - 缺 gradio 也要能起 API
-        logger.warning("Gradio 不可用，跳过内嵌界面: %s", exc)
-        return ""
-    try:
-        demo = build_ui(orchestrator=_OrchestratorProxy(application), load_models=False)
-        gr.mount_gradio_app(application, demo, path="/ui")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("内嵌 Web 界面挂载失败: %s", exc)
-        return ""
-    logger.info("Web 界面已挂载: /ui（根路径会重定向到它）")
-    return "/ui"
 
 
 # =============================================================================
