@@ -3,7 +3,7 @@
 > 本地优先（Local-First）的视频智能分析助手：把一段视频变成**能追问、能溯源**的知识。
 > 视频、转录、关键帧、向量全部留在本机；每条回答都带 `video_id` + `clip_id` + 毫秒级时间戳。
 
-- 语言/环境：Python 3.11+ ｜ Windows 11 / Linux ｜ CPU 可跑，有 GPU 自动加速
+- 语言/环境：Python 3.11–3.13（需 ≥3.11，3.10 及以下不支持）｜ Windows 11 / Linux ｜ CPU 可跑，有 GPU 自动加速
 - 规模：约 2 万行（含测试），17 个顶层配置段（含嵌套 27 个），19 个自检套件、**600+ 断言**
 - 对外协议：CLI ｜ HTTP（含 SSE）｜ MCP（JSON-RPC 2.0）｜ Gradio Web ｜ Obsidian 插件
 - 演进计划：[docs/演进计划-视频分析策略与云端接入.md](docs/演进计划-视频分析策略与云端接入.md)
@@ -64,7 +64,7 @@
 ## 三、目录
 
 ```
-zhiying/
+VideoLens/            ← 仓库名；Python 包名与命令行工具叫 zhiying（历史产品名），二者不冲突
 ├── configs/              app_config.yaml（运行配置）· models.yaml（模型清单）· prompts.yaml
 ├── core/
 │   ├── config.py         17 个顶层配置段（含嵌套 27 个）、环境变量覆盖、跨段校验
@@ -72,26 +72,35 @@ zhiying/
 │   ├── media/            ffmpeg_utils · parser · downloader · subtitles · scene_detect
 │   ├── models/           manager · asr · vl · llm · embed
 │   ├── rag/              chunker · hybrid_search · vector_store
-│   ├── storage/          repository（SQLite 六张表 + 容量闸门 + 任务恢复）
-│   └── pipeline/         orchestrator（十阶段）· context_builder
+│   ├── storage/          repository（SQLite 七张表 + 容量闸门 + 任务恢复 + 问答历史）
+│   └── pipeline/         orchestrator（十阶段）· context_builder · chapters · claims
 ├── api/                  main（装配）· jobs（统一任务体系）· routes（REST+SSE）· mcp_server（JSON-RPC）
-├── clients/              cli · gradio_ui · obsidian_plugin
-├── scripts/              download_models.py · init_db.py · preflight.py（启动预检）
-├── tests/                12 个套件 + run_all.py（零 pytest 依赖）
+├── clients/              cli · gradio_ui（旧界面，仍可用）· obsidian_plugin
+├── scripts/              download_models.py · init_db.py · preflight.py（启动预检）· setup_gpu.py
+├── tests/                20 个套件 + run_all.py（零 pytest 依赖，450+ 断言）
 ├── examples/             hybrid_search_demo.py
 ├── start.bat             Windows 一键启动（ASCII 外壳）
 ├── start.ps1             启动器主体 + 环境检查
+├── runtime/              GPU 栈隔离目录（git 忽略；CUDA 版 torch 与 CUDA 运行库装这里，不污染系统）
 ├── models/               权重缓存（git 忽略，由 ModelManager 拉取）
 └── data/                 SQLite / Chroma / 关键帧 / 导出（git 忽略）
 ```
+
+> **名字说明**：GitHub 仓库名是 **VideoLens**（`git clone` 得到的文件夹也叫
+> `VideoLens`）；代码里的 Python 包、CLI 命令和产品名叫 **zhiying（知影）**——
+> 这只是历史命名，两者指向同一个项目。
 
 ---
 
 ## 四、安装
 
 ```bash
-git clone <repo> && cd zhiying
+git clone <repo> && cd VideoLens     # 文件夹名是 VideoLens，不是 zhiying
 python -m venv .venv && .venv\Scripts\activate     # Linux: source .venv/bin/activate
+
+# 0) Python 版本：3.11 / 3.12 / 3.13 均可（pyproject 声明 requires-python >= 3.11）
+#    3.10 及以下会因类型标注语法直接报错；3.13 若个别依赖无轮子，用 3.11 最稳。
+#    没装 3.11+？winget install Python.Python.3.12 装一个即可（可与旧版共存）。
 
 # 1) 核心依赖（不含三个大底座：torch / transformers / llama-cpp-python）
 pip install -r requirements.txt
