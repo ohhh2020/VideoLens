@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>知影 · 分析工作台</title>
+<link rel="stylesheet" href="/assets/workbench/style.css">
+<link rel="stylesheet" href="/assets/shared/markdown.css">
+</head>
+<body>
+<div class="wrap">
+  <div class="nav">
+    <div class="brand">知影 ZhiYing <small>本地优先 · 视频智能分析</small></div>
+    <div class="spacer"></div>
+    <a class="primary" href="/chat">💬 视频对话</a>
+    <details class="service-menu" id="serviceMenu">
+      <summary aria-label="服务菜单">菜单 <span aria-hidden="true">▾</span></summary>
+      <div class="service-dropdown">
+        <button type="button" id="serviceRestart">重启</button>
+        <button type="button" id="serviceStop" class="service-stop">关闭</button>
+      </div>
+    </details>
+  </div>
+  <div class="service-notice" id="serviceNotice" role="status" hidden></div>
+
+  <div class="tabs">
+    <button data-t="analyze" class="on">🎬 分析</button>
+    <button data-t="library">📚 视频库</button>
+    <button data-t="status">📊 状态</button>
+    <button data-t="settings">⚙️ 设置</button>
+    <button data-t="memory">🧠 记忆库</button>
+  </div>
+
+  <!-- ============ 分析 ============ -->
+  <section class="tabpane on" id="p-analyze">
+    <div class="card">
+      <h3>提交分析任务</h3>
+      <p class="warnline" id="pendingDevices" role="status" hidden></p>
+      <label>视频来源（本地路径或链接）</label>
+      <textarea id="src" rows="2" placeholder="D:\videos\demo.mp4 或 https://www.bilibili.com/video/BVxxx"></textarea>
+      <div class="grid" style="margin-top:12px">
+        <div><label>标题（可选）</label><input type="text" id="title" placeholder="留空自动生成"></div>
+        <div><label>语言（可选）</label>
+          <select id="lang"><option value="">自动检测</option><option value="zh">中文</option><option value="en">英文</option></select></div>
+      </div>
+      <div class="checks">
+        <label><input type="checkbox" id="force">强制重跑</label>
+        <label><input type="checkbox" id="skipVision">跳过视觉理解（更快）</label>
+        <label><input type="checkbox" id="skipSummary">跳过总结</label>
+        <label><input type="checkbox" id="skipVectors">跳过向量入库</label>
+      </div>
+      <button class="btn" id="go">开始分析</button>
+      <span class="savehint" id="analyzeHint"></span>
+      <div class="prog" id="progWrap" style="display:none"><i id="prog"></i></div>
+      <div class="logline" id="progText"></div>
+    </div>
+    <div class="card" id="resultCard" style="display:none">
+      <h3 id="resultTitle">分析结果</h3>
+      <div id="resultBody" style="font-size:13px"></div>
+      <div id="transcriptBox" style="display:none;margin-top:10px">
+        <div style="display:flex;align-items:center;gap:10px">
+          <b style="font-size:13px">📝 语音转写结果</b>
+          <span class="savehint" id="transcriptMeta"></span>
+        </div>
+        <div id="transcriptBody" style="max-height:420px;overflow-y:auto;margin-top:8px;
+             background:var(--panel2);border:1px solid var(--border);border-radius:10px;
+             padding:10px 14px;font-size:12.5px;line-height:1.7"></div>
+      </div>
+      <div style="margin-top:10px;display:flex;gap:14px;align-items:center">
+        <a class="tlink" id="goChat" href="#">💬 去对话页追问 →</a>
+        <a class="tlink" id="exportMd" href="#" style="color:var(--ok)">📄 一键导出报告 MD</a>
+        <a class="tlink" data-detail-only id="toggleTranscript" href="#">📝 转写结果</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 视频库 ============ -->
+  <section class="tabpane" id="p-library">
+    <div class="card">
+      <h3>视频库 <button class="btn ghost" id="refreshLib" style="float:right;padding:5px 14px;font-size:12px">刷新</button></h3>
+      <table>
+        <thead><tr><th>标题</th><th>状态</th><th>时长</th><th data-detail-only>切片</th><th data-detail-only>语言</th><th style="width:220px">操作</th></tr></thead>
+        <tbody id="libBody"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ============ 状态 ============ -->
+  <section class="tabpane" id="p-status">
+    <div class="card"><h3>容量与用量</h3><div class="stat" id="statBox"></div></div>
+    <div class="card"><h3>后端通道</h3><div id="backendBox"></div></div>
+  </section>
+
+  <!-- ============ 设置 ============ -->
+  <section class="tabpane" id="p-settings">
+    <p class="muted">首次使用请填写两个云端通道的服务地址、模型名和 API Key；保存后通过右上角菜单重启服务。灰色模型名仅为示例。</p>
+    <div class="card">
+      <h3>大模型（云端）</h3>
+      <div class="grid">
+        <div><label>模式</label>
+          <select id="llm_mode" disabled><option value="cloud">仅云端</option></select></div>
+        <div><label for="llm_key">API Key</label><div class="key-control key-hidden" id="llm_key_control"><input type="password" id="llm_key" placeholder="请输入完整 API Key" autocomplete="new-password" spellcheck="false" aria-describedby="llm_key_hint"><span class="key-mask" id="llm_key_mask" aria-hidden="true" hidden>●●●●●●●●</span><button type="button" class="key-toggle" id="llm_key_toggle" aria-label="显示大模型 API Key" aria-pressed="false">显示</button></div><p class="key-hint" id="llm_key_hint">默认隐藏；输入新密钥可替换，未修改则保留。</p><label><input type="checkbox" id="llm_clear_key">未输入新密钥时清除已保存密钥</label></div>
+        <div class="full"><label>base_url（OpenAI 兼容）</label>
+          <input type="text" id="llm_base" placeholder="填写服务商提供的 OpenAI 兼容接口地址" autocomplete="off"></div>
+        <div><label>模型名</label><input type="text" id="llm_model" placeholder="qwen3.5-flash"></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>视觉理解（云端）</h3>
+      <div class="checks"><label><input type="checkbox" id="vl_on" checked disabled>云端视觉（必须启用）</label></div>
+      <div class="grid">
+        <div><label for="vl_key">API Key</label><div class="key-control key-hidden" id="vl_key_control"><input type="password" id="vl_key" placeholder="请输入完整 API Key" autocomplete="new-password" spellcheck="false" aria-describedby="vl_key_hint"><span class="key-mask" id="vl_key_mask" aria-hidden="true" hidden>●●●●●●●●</span><button type="button" class="key-toggle" id="vl_key_toggle" aria-label="显示视觉理解 API Key" aria-pressed="false">显示</button></div><p class="key-hint" id="vl_key_hint">默认隐藏；输入新密钥可替换，未修改则保留。</p><label><input type="checkbox" id="vl_clear_key">未输入新密钥时清除已保存密钥</label></div>
+        <div><label>base_url</label><input type="text" id="vl_base"></div>
+        <div><label>模型名</label><input type="text" id="vl_model" placeholder="qwen3.5-flash"></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>本地模型运行设备</h3>
+      <div class="grid">
+        <div><label for="asr_device">faster-whisper-small · 语音转写</label><select id="asr_device"><option value="cpu">CPU</option><option value="cuda">GPU / CUDA（FP16）</option></select></div>
+        <div><label for="text_device">BGE-M3 · 文本向量</label><select id="text_device"><option value="cpu">CPU</option><option value="cuda">GPU / CUDA</option></select></div>
+        <div><label for="image_device">SigLIP2 · 图像向量</label><select id="image_device"><option value="cpu">CPU</option><option value="cuda">GPU / CUDA</option></select></div>
+      </div>
+      <p class="muted" id="deviceHint"></p>
+      <p class="muted" id="activeDevices"></p>
+      <p class="muted">三个模型独立选择；保存后等待当前推理结束并切换，无需重启。目标设备加载失败时保留原模型和设置。</p>
+    </div>
+    <div class="card">
+      <h3>分析报告显示</h3>
+      <label for="report_mode">显示模式</label>
+      <select id="report_mode"><option value="user">用户模式：内容概览与关键结论</option><option value="detailed">详细模式：完整报告与分析信息</option></select>
+      <p class="muted">选择后立即预览当前完整报告；保存后记住偏好并同步其他打开的工作台。切换不重新分析，也不删除完整报告内容。</p>
+    </div>
+    <button class="btn" id="saveSet">保存设置</button>
+    <span class="savehint" id="saveSetHint">本地模型设备和报告显示无需重启；云端及其他后端设置变更仍需重启</span>
+    <div class="card" style="margin-top:14px"><h3>当前通道状态</h3><div id="setBackends"></div></div>
+  </section>
+  <section class="tabpane" id="p-memory">
+    <div class="card">
+      <h3>偏好记忆库</h3>
+      <p class="muted">从视频分析历史和你的提问中归纳兴趣与关注点，供后续总结和回答参考。你可以随时增加、修改或删除。</p>
+      <div class="checks">
+        <label><input type="checkbox" id="memoryEnabled">在总结和对话中使用记忆</label>
+        <label><input type="checkbox" id="memoryAuto">从历史自动归纳</label>
+      </div>
+      <button class="btn ghost" id="memoryRefresh">从历史更新</button>
+      <button class="btn ghost" id="memoryReload">刷新列表</button>
+      <a href="#memoryNew" class="tlink">＋增加记忆</a>
+      <p id="memoryStatus" class="muted" role="status"></p>
+      <p class="muted">关闭自动归纳后仍可手动编辑。删除会移除文字和向量，不会从相同的已处理历史重复生成；新的历史仍可形成新记忆。</p>
+    </div>
+    <div id="memoryList"></div>
+    <div class="card">
+      <h3>增加记忆</h3>
+      <label for="memoryNew">用一段精简完整的话描述偏好</label>
+      <textarea id="memoryNew" rows="2" placeholder="例如：用户更关注本地 AI 部署的实际性能，希望回答优先给出硬件需求与可执行步骤。"></textarea>
+      <label for="memoryNewKind">偏好类型</label>
+      <select id="memoryNewKind"><option value="interest">视频兴趣</option><option value="question">问题关注点</option><option value="style">回答风格（适用于所有主题）</option></select>
+      <button class="btn" id="memoryAdd" style="margin-top:12px">增加记忆</button>
+    </div>
+    <p class="muted" id="memoryFile"></p>
+  </section>
+</div>
+<div class="toast" id="toast"></div>
+
+<script src="/assets/vendor/marked.umd.js" defer></script>
+<script src="/assets/vendor/purify.min.js" defer></script>
+<script src="/assets/shared/markdown.js" defer></script>
+<script src="/assets/workbench/progress.js" defer></script>
+<script src="/assets/workbench/memory.js" defer></script>
+<script src="/assets/workbench/service.js" defer></script>
+<script src="/assets/workbench/keys.js" defer></script>
+<script src="/assets/workbench/app.js" defer></script>
+</body>
+</html>

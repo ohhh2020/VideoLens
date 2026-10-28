@@ -89,7 +89,7 @@ def init_storage(config: Any, *, create_dirs: bool = True) -> dict[str, Any]:
                 report["problems"].append(f"目录不可用 {key}: {exc}")
 
     try:
-        from core.storage.repository import SqliteRepository  # noqa: PLC0415
+        from backend.storage.repository import SqliteRepository  # noqa: PLC0415
 
         repo = SqliteRepository.from_config(config)
         report["database"] = str(getattr(repo, "db_path", config.path("sqlite")))
@@ -105,7 +105,7 @@ def init_storage(config: Any, *, create_dirs: bool = True) -> dict[str, Any]:
 
 def storage_report(config: Any) -> str:
     """人类可读的存储报告（表 / 当前 / 上限 / 占用）。"""
-    from core.storage.repository import SqliteRepository  # noqa: PLC0415
+    from backend.storage.repository import SqliteRepository  # noqa: PLC0415
 
     repo = SqliteRepository.from_config(config)
     try:
@@ -143,8 +143,11 @@ def _reset(config: Any) -> list[str]:
     """删库文件与向量目录。**不动** videos/audio（那是用户的素材）。"""
     removed: list[str] = []
     db_path = Path(config.path("sqlite"))
-    for candidate in (db_path, db_path.with_suffix(db_path.suffix + "-wal"),
-                      db_path.with_suffix(db_path.suffix + "-shm")):
+    for candidate in (
+        db_path,
+        db_path.with_suffix(db_path.suffix + "-wal"),
+        db_path.with_suffix(db_path.suffix + "-shm"),
+    ):
         if candidate.exists():
             candidate.unlink()
             removed.append(str(candidate))
@@ -173,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="输出 JSON")
     args = parser.parse_args(argv)
 
-    from core.config import load_app_config  # noqa: PLC0415
+    from backend.config import load_app_config  # noqa: PLC0415
 
     try:
         config = load_app_config(args.config)
@@ -190,10 +193,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.reset:
         db_path = Path(config.path("sqlite"))
         if not args.yes:
-            answer = input(
-                f"将删除 {db_path} 与向量目录 {config.path('chroma')}"
-                f"（用户视频文件保留）。确认？[y/N] "
-            ).strip().lower()
+            answer = (
+                input(
+                    f"将删除 {db_path} 与向量目录 {config.path('chroma')}"
+                    f"（用户视频文件保留）。确认？[y/N] "
+                )
+                .strip()
+                .lower()
+            )
             if answer not in {"y", "yes"}:
                 print("已取消")
                 return EXIT_OK
@@ -214,8 +221,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"项目根: {config.root_dir}")
         print(f"数据目录: {config.paths.data}")
         print(f"模型目录: {config.paths.models}")
-        print(f"数据库: {report.get('database') or '-'}"
-              f"（schema v{report.get('schema_version', 0)}）")
+        print(
+            f"数据库: {report.get('database') or '-'}（schema v{report.get('schema_version', 0)}）"
+        )
         print(f"表: {', '.join(report.get('tables') or []) or '-'}")
         print("")
         try:

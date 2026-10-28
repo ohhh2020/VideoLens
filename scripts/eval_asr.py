@@ -35,7 +35,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.config import AppConfig, ConfigError, get_app_config  # noqa: E402
+from backend.config import AppConfig, ConfigError, get_app_config  # noqa: E402
 
 logger = logging.getLogger("zhiying.eval_asr")
 
@@ -245,7 +245,11 @@ def score_sentences(reference: str, hypothesis: str) -> list[SentenceScore]:
         return []
     if not hyp_sents:
         return [
-            SentenceScore(reference=s, hypothesis="", errors=Errors(delete=len(_fold(s)), total=len(_fold(s))))
+            SentenceScore(
+                reference=s,
+                hypothesis="",
+                errors=Errors(delete=len(_fold(s)), total=len(_fold(s))),
+            )
             for s in ref_sents
         ]
 
@@ -276,7 +280,9 @@ def score_sentences(reference: str, hypothesis: str) -> list[SentenceScore]:
                     SentenceScore(
                         reference=ref_sents[i1 + offset],
                         hypothesis=hyp_sents[hyp_index],
-                        errors=align(list(key_ref[i1 + offset]), list(key_hyp[hyp_index])),
+                        errors=align(
+                            list(key_ref[i1 + offset]), list(key_hyp[hyp_index])
+                        ),
                     )
                 )
             else:
@@ -285,7 +291,8 @@ def score_sentences(reference: str, hypothesis: str) -> list[SentenceScore]:
                         reference=ref_sents[i1 + offset],
                         hypothesis="",
                         errors=Errors(
-                            delete=len(key_ref[i1 + offset]), total=len(key_ref[i1 + offset])
+                            delete=len(key_ref[i1 + offset]),
+                            total=len(key_ref[i1 + offset]),
                         ),
                     )
                 )
@@ -301,7 +308,7 @@ def load_reference(path: Path) -> str:
     """读参考文本。字幕文件走项目自己的解析器，其它按 UTF-8 纯文本。"""
     suffix = path.suffix.lower()
     if suffix in _SUBTITLE_SUFFIX:
-        from core.media.subtitles import load_subtitles  # noqa: PLC0415
+        from backend.media.subtitles import load_subtitles  # noqa: PLC0415
 
         # load_subtitles 返回 (cues, 命中文件, 告警)，且收的是候选序列。
         cues, _used, _warnings = load_subtitles([path])
@@ -321,7 +328,7 @@ def load_reference(path: Path) -> str:
 
 def run_asr(audio: Path, config: AppConfig) -> Any:
     """跑一次本项目的转写链路（字幕优先，回退 whisper）。"""
-    from core.models.asr import AsrConfig, AsrEngine  # noqa: PLC0415
+    from backend.models.asr import AsrConfig, AsrEngine  # noqa: PLC0415
 
     engine = AsrEngine(AsrConfig.from_config(config))
     return engine.transcribe(audio, video_id="eval", allow_subtitle=False)
@@ -345,7 +352,9 @@ def render(report: Report, *, top: int) -> str:
     lines.append(f"  参考长度   {report.reference_len} {unit}")
     lines.append(f"  耗时       {report.elapsed_ms / 1000:.1f}s")
     lines.append("")
-    lines.append(f"  错误构成   替换 {report.errors.sub} / 删除 {report.errors.delete} / 插入 {report.errors.insert}")
+    lines.append(
+        f"  错误构成   替换 {report.errors.sub} / 删除 {report.errors.delete} / 插入 {report.errors.insert}"
+    )
     lines.append(f"  {report.verdict()}（需求 2.4.1，数字已归一化）")
     gap = report.errors_raw.rate - report.rate
     if gap > 0.005:
@@ -402,7 +411,9 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
 
     try:
-        reference = args.text if args.text is not None else load_reference(Path(args.reference))
+        reference = (
+            args.text if args.text is not None else load_reference(Path(args.reference))
+        )
     except (OSError, UnicodeDecodeError) as exc:
         print(f"读取参考文本失败：{exc}", file=sys.stderr)
         return EXIT_USAGE

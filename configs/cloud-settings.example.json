@@ -1,0 +1,11 @@
+{
+  "llm.mode": "cloud",
+  "llm.cloud.base_url": "",
+  "llm.cloud.model": "",
+  "llm.cloud.api_key": "",
+  "vl.cloud_enabled": true,
+  "vl.cloud_base_url": "",
+  "vl.cloud_model": "",
+  "vl.cloud_api_key": "",
+  "models.device": "cpu"
+}

@@ -19,7 +19,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-BASE = Path(__file__).resolve().parent / "media"
+BASE = __import__("backend.runtime", fromlist=["runtime_path"]).runtime_path(
+    "tests/media"
+)
 DEMO = BASE / "demo.mp4"
 LOW = BASE / "low.mp4"
 
@@ -51,18 +53,49 @@ def ensure(*, verbose: bool = False) -> tuple[Path, Path]:
     """确保两个夹具存在，返回 ``(demo, low)`` 路径。"""
     _run(
         [
-            "-f", "lavfi", "-i", "testsrc2=s=1280x720:r=25:d=10",
-            "-f", "lavfi", "-i", "smptebars=s=1280x720:r=25:d=10",
-            "-f", "lavfi", "-i", "testsrc=s=1280x720:r=25:d=10",
-            "-f", "lavfi", "-i", "rgbtestsrc=s=1280x720:r=25:d=10",
-            "-f", "lavfi", "-i", "sine=frequency=440:duration=40",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=1280x720:r=25:d=10",
+            "-f",
+            "lavfi",
+            "-i",
+            "smptebars=s=1280x720:r=25:d=10",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=s=1280x720:r=25:d=10",
+            "-f",
+            "lavfi",
+            "-i",
+            "rgbtestsrc=s=1280x720:r=25:d=10",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=40",
             "-filter_complex",
             "[0:v]format=yuv420p[v0];[1:v]format=yuv420p[v1];"
             "[2:v]format=yuv420p[v2];[3:v]format=yuv420p[v3];"
             "[v0][v1][v2][v3]concat=n=4:v=1:a=0[v]",
-            "-map", "[v]", "-map", "4:a",
-            "-r", "25", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-shortest",
+            "-map",
+            "[v]",
+            "-map",
+            "4:a",
+            "-r",
+            "25",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-shortest",
             str(DEMO),
         ],
         DEMO,
@@ -70,10 +103,27 @@ def ensure(*, verbose: bool = False) -> tuple[Path, Path]:
     )
     _run(
         [
-            "-f", "lavfi", "-i", "testsrc2=s=640x360:r=25:d=12",
-            "-f", "lavfi", "-i", "sine=frequency=330:duration=12",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "-shortest",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=640x360:r=25:d=12",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=330:duration=12",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "26",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "64k",
+            "-shortest",
             str(LOW),
         ],
         LOW,

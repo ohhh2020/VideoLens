@@ -14,13 +14,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-from core.pipeline.chapters import (  # noqa: E402
+from backend.pipeline.chapters import (  # noqa: E402
     Chapter,
     ChapterPlan,
     chapters_markdown,
     plan_chapters,
 )
-from core.pipeline.context_builder import spread_order  # noqa: E402
+from backend.pipeline.context_builder import spread_order  # noqa: E402
 
 PASS = 0
 FAIL = 0
@@ -53,17 +53,25 @@ def main() -> int:
     clips = make_clips(12)  # 0–360s
     plans = plan_chapters(clips, chapter_seconds=120, duration_ms=360_000)
     check("360s / 120s → 3 章", len(plans) == 3, len(plans))
-    check("章号从 1 开始连续", [p.index for p in plans] == [1, 2, 3], [p.index for p in plans])
+    check(
+        "章号从 1 开始连续",
+        [p.index for p in plans] == [1, 2, 3],
+        [p.index for p in plans],
+    )
     check("首章从 0 开始", plans[0].start_ms == 0, plans[0].start_ms)
     check("末章到片尾", plans[-1].end_ms == 360_000, plans[-1].end_ms)
     check("12 个切片全部归入", sum(len(p.clip_ids) for p in plans) == 12)
-    check("章节不重叠", all(
-        plans[i].end_ms <= plans[i + 1].start_ms for i in range(len(plans) - 1)
-    ))
+    check(
+        "章节不重叠",
+        all(plans[i].end_ms <= plans[i + 1].start_ms for i in range(len(plans) - 1)),
+    )
     check("每章非空", all(p.clip_ids for p in plans))
     check("每章有时长", all(p.duration_ms > 0 for p in plans))
-    check("time_range 格式", "–" in plans[0].time_range and ":" in plans[0].time_range,
-          plans[0].time_range)
+    check(
+        "time_range 格式",
+        "–" in plans[0].time_range and ":" in plans[0].time_range,
+        plans[0].time_range,
+    )
 
     print("\n=== 2. 上限与边界 ===")
     many = plan_chapters(clips, chapter_seconds=10, duration_ms=360_000, max_chapters=4)
@@ -79,7 +87,11 @@ def main() -> int:
     # 乱序输入：时间戳不递增也要能正确分桶
     shuffled = [clips[5], clips[0], clips[9], clips[2]]
     got = plan_chapters(shuffled, chapter_seconds=120, duration_ms=360_000)
-    check("乱序输入仍按时间分章", got[0].start_ms == 0, [(p.start_ms, p.end_ms) for p in got])
+    check(
+        "乱序输入仍按时间分章",
+        got[0].start_ms == 0,
+        [(p.start_ms, p.end_ms) for p in got],
+    )
 
     print("\n=== 3. 数据类 ===")
     plan = ChapterPlan(index=2, start_ms=60_000, end_ms=120_000, clip_ids=("c1", "c2"))
@@ -92,16 +104,28 @@ def main() -> int:
         summary="这一段先讲训练，接着讲推理。",
         clip_ids=("c9", "c10"),
     )
-    check("heading 含章号与时间", "第 3 章" in ch.heading and "00:10:00.000" in ch.heading, ch.heading)
+    check(
+        "heading 含章号与时间",
+        "第 3 章" in ch.heading and "00:10:00.000" in ch.heading,
+        ch.heading,
+    )
     check("heading 取摘要首句", "这一段先讲训练" in ch.heading, ch.heading)
     check("Chapter.to_dict 可序列化", isinstance(ch.to_dict()["clip_ids"], list))
-    check("空摘要 heading 不空", bool(Chapter(index=1, start_ms=0, end_ms=1000).heading))
+    check(
+        "空摘要 heading 不空", bool(Chapter(index=1, start_ms=0, end_ms=1000).heading)
+    )
 
     print("\n=== 4. markdown ===")
     md = chapters_markdown(
         "演示视频",
         [
-            Chapter(index=1, start_ms=0, end_ms=180_000, summary="第一段。", clip_ids=("c0",)),
+            Chapter(
+                index=1,
+                start_ms=0,
+                end_ms=180_000,
+                summary="第一段。",
+                clip_ids=("c0",),
+            ),
             Chapter(
                 index=2,
                 start_ms=180_000,

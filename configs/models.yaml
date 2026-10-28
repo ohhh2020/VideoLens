@@ -1,283 +1,104 @@
-﻿# 知影 (ZhiYing) —— 模型清单与下载策略
-# ---------------------------------------------------------------------------
-# 本文件是"模型权重"的唯一真相来源。业务代码不得出现任何权重路径字符串，
-# 一律通过 ModelManager.ensure_model("<name>") 取目录。
-#
-# 覆盖优先级（由高到低）:
-#   ModelManager(config_path=...)  >  $ZHIYING_CONFIG  >  <项目根>/configs/models.yaml
-# 缓存根目录覆盖优先级:
-#   ModelManager(cache_root=...)   >  $ZHIYING_MODEL_DIR  >  cache.root  >  <项目根>/models
-#
-# sources 支持两种写法:
-#   modelscope: "org/repo"                                  # 简写，revision 取 defaults.revision
-#   modelscope: {repo_id: "...", revision: "v1.0"}          # 完整写法
-#
-# required_files 支持 glob，用于"目录存在但被删改"的完整性判定。
-# ---------------------------------------------------------------------------
+# 三个必需本地模型；使用 Hugging Face 协议及可配置镜像下载。
 version: 1
-
 cache:
-  root: "models"                 # 相对项目根，也可写绝对路径
-  partial_dirname: ".partial"    # 下载暂存区（原子替换的临时目录所在）
-  manifest_name: "manifest.json" # 每个模型目录内的元数据文件名
-  partial_retention_hours: 24    # 超过该时长的暂存目录可被 prune_partials 清掉
-
+  root: models
+  partial_dirname: .partial
+  manifest_name: manifest.json
+  partial_retention_hours: 24
 network:
-  # 国内网络策略：先 ModelScope，失败自动回退 HuggingFace（可走镜像）
-  sources_order: ["modelscope", "huggingface"]
-  timeout: 60                    # 单次网络操作超时（秒），写入 HF_HUB_DOWNLOAD_TIMEOUT
-  etag_timeout: 30               # 元数据/ETag 超时
-  retries: 4                     # 每个下载源的最大尝试次数
-  backoff_base: 2.0              # 指数退避基数：2s, 4s, 8s, ...
-  backoff_max: 45.0              # 单次退避上限
-  backoff_jitter: 0.35           # 抖动系数，避免多进程同频重试
-  progress_interval: 0.4         # 进度条刷新间隔（秒）
-  max_workers: 4                 # 文件级并发（snapshot_download）
-  hf_endpoint: "https://hf-mirror.com"   # 置空则走官方 huggingface.co
-  modelscope_endpoint: null              # 置空则走 https://www.modelscope.cn
-  hf_offline: false              # true 时设置 HF_HUB_OFFLINE=1（仅用本地缓存）
+  sources_order:
+  - huggingface
+  timeout: 60
+  etag_timeout: 30
+  retries: 4
+  backoff_base: 2.0
+  backoff_max: 45.0
+  backoff_jitter: 0.35
+  progress_interval: 0.4
+  max_workers: 4
+  hf_endpoint: https://hf-mirror.com
+  modelscope_endpoint: null
+  hf_offline: false
   show_progress: true
-  verify_sha256: false           # 全局默认是否做哈希校验（大文件会明显变慢）
-
+  verify_sha256: false
 defaults:
-  revision: "main"
-
+  revision: main
 models:
-  # -------------------------------------------------------------------------
-  # 1) 语音转写：faster-whisper (CTranslate2 格式)
-  #    加载方: core/adapters/asr.py -> WhisperModel(model_dir)
-  # -------------------------------------------------------------------------
-  faster-whisper-large-v3:
-    kind: "asr"
-    required: true
-    license: "MIT"
-    description: "faster-whisper large-v3（CTranslate2 int8/fp16），中文 CER ≤ 15% 目标基线"
-    size_hint_gb: 3.1
-    targets:
-      asr: "faster-whisper"
-    sources:
-      modelscope:
-        repo_id: "pengzhendong/faster-whisper-large-v3"
-        revision: "master"
-      # 原本这里配 Systrex/faster-whisper-large-v3，实测 HF 上返回 404
-      # （hf-mirror 与 huggingface.co 一致），已移除；large-v3 目前只有 ModelScope 源。
-      # CPU 机器请改用下面的 faster-whisper-large-v3-turbo（同样走 HF，速度快约 8 倍）。
-    ignore_patterns: ["*.md", "*.png", "*.jpg", "*.jpeg", ".gitattributes"]
-    required_files:
-      - "config.json"
-      - "model.bin"
-      - "tokenizer.json"
-      - "vocabulary.*"
-
-  # -------------------------------------------------------------------------
-  # 1b) 语音转写（CPU 推荐）：large-v3-turbo
-  #     large-v3 的蒸馏版，解码器只有 4 层，CPU 上快 6~8 倍，中文 CER 略升。
-  #     没有 GPU 的机器用这个才不会出现"1 小时视频转写 3 小时"。
-  # -------------------------------------------------------------------------
-  faster-whisper-large-v3-turbo:
-    kind: "asr"
-    required: false
-    license: "MIT"
-    description: "faster-whisper large-v3-turbo（CTranslate2），CPU 环境的实际默认选择"
-    size_hint_gb: 1.6
-    targets:
-      asr: "faster-whisper"
-    sources:
-      huggingface:
-        repo_id: "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
-        revision: "main"
-    ignore_patterns: ["*.md", "*.png", "*.jpg", "*.jpeg", ".gitattributes"]
-    required_files:
-      - "config.json"
-      - "model.bin"
-      - "tokenizer.json"
-      - "vocabulary.*"
-
-  # -------------------------------------------------------------------------
-  # 1c) 语音转写（低配兜底）：medium / small
-  #     显存或内存吃紧时用，只作为可选降级档，默认不下载。
-  # -------------------------------------------------------------------------
-  faster-whisper-medium:
-    kind: "asr"
-    required: false
-    license: "MIT"
-    description: "faster-whisper medium，内存 <8G 时的降级档"
-    size_hint_gb: 1.5
-    targets:
-      asr: "faster-whisper"
-    sources:
-      huggingface:
-        repo_id: "guillaumekln/faster-whisper-medium"
-        revision: "main"
-    ignore_patterns: ["*.md", "*.png", "*.jpg", "*.jpeg", ".gitattributes"]
-    required_files:
-      - "config.json"
-      - "model.bin"
-      - "tokenizer.json"
-      - "vocabulary.*"
-
-  faster-whisper-small:
-    kind: "asr"
-    required: false
-    license: "MIT"
-    description: "faster-whisper small，内存 <4G 时的最低可用档（精度明显下降）"
-    size_hint_gb: 0.5
-    targets:
-      asr: "faster-whisper"
-    sources:
-      huggingface:
-        repo_id: "guillaumekln/faster-whisper-small"
-        revision: "main"
-    ignore_patterns: ["*.md", "*.png", "*.jpg", "*.jpeg", ".gitattributes"]
-    required_files:
-      - "config.json"
-      - "model.bin"
-      - "tokenizer.json"
-      - "vocabulary.*"
-
-  # -------------------------------------------------------------------------
-  # 2) 文本向量：BGE-M3（稠密 + 稀疏，供 Chroma 文本集合使用）
-  #    加载方: core/adapters/embedder.py -> BGEM3Embedder
-  # -------------------------------------------------------------------------
   bge-m3:
-    kind: "text-embedding"
+    kind: text-embedding
     required: true
-    license: "MIT"
-    description: "BAAI/bge-m3，中英多语检索向量（1024 维），同时供 BM25 词表构建"
+    license: MIT
+    description: BAAI/bge-m3，中英多语检索向量（1024 维），同时供 BM25 词表构建
     size_hint_gb: 2.3
     targets:
-      text_embedding: "bge-m3"
+      text_embedding: bge-m3
     sources:
-      modelscope:
-        repo_id: "BAAI/bge-m3"
-        revision: "master"
       huggingface:
-        repo_id: "BAAI/bge-m3"
-        revision: "main"
-    ignore_patterns: ["*.md", "*.png", "*.jpg", "onnx/*", "*.onnx", ".gitattributes"]
+        repo_id: BAAI/bge-m3
+        revision: main
+    ignore_patterns:
+    - '*.md'
+    - '*.png'
+    - '*.jpg'
+    - onnx/*
+    - '*.onnx'
+    - .gitattributes
     required_files:
-      - "config.json"
-      - "tokenizer.json"
-
-  # -------------------------------------------------------------------------
-  # 3) 图像向量：SigLIP2 base（关键帧跨模态检索）
-  #    加载方: core/adapters/embedder.py -> SigLIP2Embedder
-  # -------------------------------------------------------------------------
-  siglip2-base:
-    kind: "image-embedding"
+    - config.json
+    - tokenizer.json
+    - pytorch_model.bin
+    allow_patterns:
+    - '*.json'
+    - pytorch_model.bin
+    - sentencepiece.bpe.model
+  faster-whisper-small:
+    kind: asr
     required: true
-    license: "Apache-2.0"
-    description: "google/siglip2-base-patch16-224，图文对齐向量，用于关键帧以文搜图"
+    license: MIT
+    description: 必需的本地语音识别模型；禁止缺失降级
+    size_hint_gb: 0.5
+    targets:
+      asr: faster-whisper
+    sources:
+      huggingface:
+        repo_id: guillaumekln/faster-whisper-small
+        revision: main
+    ignore_patterns:
+    - '*.md'
+    - '*.png'
+    - '*.jpg'
+    - '*.jpeg'
+    - .gitattributes
+    required_files:
+    - config.json
+    - model.bin
+    - tokenizer.json
+    - vocabulary.*
+  siglip2-base:
+    kind: image-embedding
+    required: true
+    license: Apache-2.0
+    description: google/siglip2-base-patch16-224，图文对齐向量，用于关键帧以文搜图
     size_hint_gb: 1.6
     targets:
-      image_embedding: "siglip2"
+      image_embedding: siglip2
     sources:
-      modelscope:
-        repo_id: "AI-ModelScope/siglip2-base-patch16-224"
-        revision: "master"
       huggingface:
-        repo_id: "google/siglip2-base-patch16-224"
-        revision: "main"
-    ignore_patterns: ["*.md", "*.png", "*.jpg", "*.gif", ".gitattributes"]
+        repo_id: google/siglip2-base-patch16-224
+        revision: main
+    ignore_patterns:
+    - '*.md'
+    - '*.png'
+    - '*.jpg'
+    - '*.gif'
+    - .gitattributes
     required_files:
-      - "config.json"
-      - "preprocessor_config.json"
-      - "*.safetensors"
-
-  # -------------------------------------------------------------------------
-  # 4) 视觉理解：Qwen2-VL-2B GGUF（llama.cpp 多模态，配 mmproj 视觉投影）
-  #    加载方: core/adapters/vlm.py -> Qwen2VLGGUF
-  #    注意: 必须同时拿到 mmproj 文件，否则视觉通道不可用（会降级为纯文本总结）
-  # -------------------------------------------------------------------------
-  qwen2-vl-2b-gguf:
-    kind: "vision-llm"
-    required: true
-    license: "Apache-2.0"
-    description: "Qwen2-VL-2B-Instruct GGUF（Q4_K_M + mmproj），关键帧画面描述与 OCR"
-    size_hint_gb: 2.9
-    targets:
-      vlm: "llama.cpp"
-    sources:
-      modelscope:
-        repo_id: "lmstudio-community/Qwen2-VL-2B-Instruct-GGUF"
-        revision: "master"
-      huggingface:
-        repo_id: "lmstudio-community/Qwen2-VL-2B-Instruct-GGUF"
-        revision: "main"
-    # 仓库里还有 Q3_K_L / Q6_K / Q8_0；放行 *.gguf 会下 4 份模型（约 6GB）。
-    # 只要 Q4_K_M 与 mmproj 视觉投影。文件名是大写 Q4_K_M，小写变体一并留着。
+    - config.json
+    - preprocessor_config.json
+    - '*.safetensors'
+    - tokenizer.json
+    - tokenizer.model
     allow_patterns:
-      - "*Q4_K_M*"
-      - "*q4_k_m*"
-      - "*mmproj*"
-      - "*.json"
-    ignore_patterns: ["*.md", "*.png", ".gitattributes"]
-    # required_files 是 AND 语义：大小写两个变体不能并列写，否则永远判定缺失。
-    # lmstudio 仓库里就叫 Q4_K_M；Windows 的 glob 不敏感，Linux 上大小写也要对得上。
-    required_files:
-      - "*Q4_K_M*.gguf"
-      - "*mmproj*.gguf"
-
-  # -------------------------------------------------------------------------
-  # 5) 文本生成：Qwen2.5-7B-Instruct GGUF（总结 / 时间线 / 问答）
-  #    加载方: core/adapters/llm.py -> LlamaCppLLM（也可切换 OpenAI 兼容云端）
-  #    注意: 仓库为分片 GGUF，allow_patterns 必须放行全部 *.gguf
-  # -------------------------------------------------------------------------
-  qwen2.5-7b-gguf:
-  qwen2.5-7b-gguf:
-    kind: "text-llm"
-    required: true
-    license: "Apache-2.0"
-    description: "Qwen2.5-7B-Instruct GGUF（Q4_K_M），本地总结与检索式问答的默认生成模型"
-    size_hint_gb: 4.7
-    targets:
-      llm: "llama.cpp"
-      llm_cloud: "openai-compatible"
-    sources:
-      modelscope:
-        repo_id: "Qwen/Qwen2.5-7B-Instruct-GGUF"
-        revision: "master"
-      huggingface:
-        repo_id: "Qwen/Qwen2.5-7B-Instruct-GGUF"
-        revision: "main"
-    # 仓库共 19 个 gguf：fp16(4 分片)+q8(3)+q6(2)+q5_k_m(2)+q5_0(2)+q4_k_m(2)
-    # +q4_0(2)+q3_k_m+q2_k，全下约 44GB。只要 q4_k_m 的两个分片（约 4.7GB）。
-    # 分片名形如 qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf，通配符天然覆盖。
-    allow_patterns:
-      - "*q4_k_m*"
-      - "*.json"
-    ignore_patterns: ["*.md", "*.png", ".gitattributes"]
-    required_files:
-      - "*q4_k_m*.gguf"
-
-  # -------------------------------------------------------------------------
-  # 6b) 文本生成（速度优先档）：Qwen3-4B
-  #     吸收自旧版 VideoLens 的实践：4B 的 Q4_K_M 在 CPU 上比 7B 快约一倍，
-  #     总结/问答质量略降但可用；纯 CPU 机器建议切到这档：
-  #       llm.local.model: qwen3-4b-gguf
-  #     （app_config.yaml 对应注释同步。默认仍是 7B —— 已下载过 7B 的用户
-  #     不应被静默触发 2.5GB 下载。）
-  # -------------------------------------------------------------------------
-  qwen3-4b-gguf:
-    kind: "text-llm"
-    required: false
-    license: "Apache-2.0"
-    description: "Qwen3-4B GGUF（Q4_K_M），速度优先档：CPU 上比 7B 快约一倍"
-    size_hint_gb: 2.5
-    targets:
-      llm: "llama.cpp"
-    sources:
-      modelscope:
-        repo_id: "Qwen/Qwen3-4B-GGUF"
-        revision: "master"
-      huggingface:
-        repo_id: "Qwen/Qwen3-4B-GGUF"
-        revision: "main"
-    # 单文件 Qwen3-4B-Q4_K_M.gguf（约 2.4GB）；模式小写以兼容大小写敏感的源
-    allow_patterns:
-      - "*Q4_K_M*"
-      - "*q4_k_m*"
-      - "*.json"
-    ignore_patterns: ["*.md", "*.png", ".gitattributes"]
-    required_files:
-      - "*4_K_M*.gguf"
+    - '*.json'
+    - '*.safetensors'
+    - tokenizer.model

@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess  # noqa: S404 - 只跑本仓库内的测试脚本
 import sys
 import time
@@ -36,24 +35,43 @@ ROOT = TESTS_DIR.parent
 
 #: (文件名, 分类, 说明) —— 顺序即执行顺序，从底层依赖向上。
 SUITES: tuple[tuple[str, str, str], ...] = (
+    ("test_cloud_setup.py", "配置", "空白云端配置、首次网页设置与生成阻断"),
+    ("test_warning_fixes.py", "兼容", "SigLIP配置序列化与下载路径/匿名字幕警告"),
+    ("test_session_logs.py", "日志", "按启动创建日志、每日递增与并发防覆盖"),
+    ("test_key_visibility.py", "设置", "密钥固定遮罩、显式读取、禁止缓存与同源边界"),
+    ("test_service_menu.py", "网页", "服务菜单重启/关闭白名单与控制台连接"),
+    ("test_video_cache.py", "网页", "云端视频缓存目录入口与本地路径边界"),
+    ("test_preference_memory.py", "记忆", "偏好提炼、文字向量映射、删除与编辑保护和生成接入"),
+    ("test_console.py", "运维", "前台控制台指令、正常关闭/重启与开发监视"),
+    ("test_model_switching.py", "设置", "设备热切换事务、并发等待与失败保留原模型"),
+    ("test_device_settings.py", "设置", "三个模型独立设备、GPU并发边界与即时报告偏好"),
+    ("test_performance.py", "性能", "模型并发边界、云端流时序、日志上下文与阶段计时"),
+    ("test_tls.py", "环境", "Git Bash 的 Conda 默认 CA 路径修复与 HTTPS 校验"),
+    ("test_environment.py", "环境", "requirements 兼容边界与激活环境后的网页启动"),
     ("test_config.py", "配置", "app_config.yaml 加载、env 覆盖、类型转换、跨段校验"),
     ("test_model_manager.py", "模型", "ModelManager 下载/校验/清单/清理"),
+    ("test_runtime_layout.py", "运维", "运行目录隔离与禁用外部模型、严格启动"),
     ("test_models.py", "模型", "ASR/VL/Embedding/LLM 四个适配器 + 提示词"),
     ("test_media_parse.py", "媒体", "字幕解析、来源识别、转写清洗"),
     ("test_media.py", "媒体", "场景检测与关键帧抽取（需要 ffmpeg）"),
     ("test_chunker.py", "切片", "自适应语音切片（静音/标点/超长兜底）"),
     ("test_vector.py", "检索", "Chroma 向量库封装（需要 chromadb）"),
     ("test_retrieval.py", "检索", "三通道 RRF 混合检索"),
+    ("test_reindex.py", "检索", "重建失败保留原索引，成功后切换活动代"),
     ("test_storage.py", "存储", "SQLite 仓储、容量限制、任务恢复"),
     ("test_pipeline.py", "流水线", "全链路编排 + 问答 + 降级路径"),
     ("test_chapters.py", "流水线", "章节分组 + 标题渲染 + 位置铺开取样"),
     ("test_claims.py", "流水线", "回答证据校验：悬空编号/错配/孤立句/补出处"),
     ("test_settings.py", "设置", "界面设置白名单、密钥打码、配置优先级、云端视觉装配"),
+    (
+        "test_cloud_credentials.py",
+        "设置",
+        "拒绝密钥掩码覆盖、认证失败停止重试和后续帧请求",
+    ),
     ("test_gc.py", "运维", "TTL 清理计划、临时文件判定、保留策略执行"),
     ("test_eval.py", "评测", "CER/WER 计算口径、数字归一化、参考文本读取"),
-    ("test_preflight.py", "运维", "启动预检：verdict 分级、--config、llm.mode/gradio.port 新 schema"),
-    ("test_api.py", "接口", "HTTP/SSE/MCP 端点、鉴权、错误信封"),
-    ("test_cli.py", "客户端", "命令解析、本地/远程后端、输出渲染"),
+    ("test_preflight.py", "运维", "必需模型缺失时预检失败"),
+    ("test_api.py", "接口", "网页任务、报告、对话与跨域隔离"),
     ("test_e2e.py", "端到端", "media↔chunker 联动"),
 )
 
@@ -72,7 +90,7 @@ def _run_one(path: Path, timeout: float, verbose: bool) -> tuple[bool, float, st
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
-    # 让测试文件能直接 `import core.*`，同时不污染子进程 cwd。
+    # 让测试文件能直接 `import backend.*`，同时不污染子进程 cwd。
     env["PYTHONPATH"] = os.pathsep.join(
         [str(ROOT), env["PYTHONPATH"]] if env.get("PYTHONPATH") else [str(ROOT)]
     )
@@ -127,7 +145,10 @@ def main(argv: list[str] | None = None) -> int:
         "--timeout", type=float, default=300.0, help="单文件超时秒数（默认 300）"
     )
     parser.add_argument(
-        "--keep-going", action="store_true", default=True, help="单个失败继续跑（默认开启）"
+        "--keep-going",
+        action="store_true",
+        default=True,
+        help="单个失败继续跑（默认开启）",
     )
     args = parser.parse_args(argv)
 
@@ -166,44 +187,10 @@ def main(argv: list[str] | None = None) -> int:
     passed = sum(1 for _n, ok, _e, _d in results if ok)
     failed = [n for n, ok, _e, _d in results if not ok]
 
-    # Node 侧（Obsidian 插件的纯逻辑）不是 Python 套件，单独跑：有 node 就验，
-    # 没有就明说跳过 —— 不能让"没装 node"变成红色失败。
-    node = os.environ.get("ZHIYING_NODE") or shutil.which("node")
-    node_probe = TESTS_DIR / "probe_obsidian_plugin.js"
-    node_status = ""
-    if node and node_probe.is_file() and not args.filter:
-        print("\n[插件] probe_obsidian_plugin.js …", flush=True)
-        try:
-            proc = subprocess.run(  # noqa: S603 - 固定路径 + 本仓库脚本
-                [node, str(node_probe)],
-                cwd=str(ROOT),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=args.timeout,
-            )
-            node_ok = proc.returncode == 0
-            node_status = "PASS" if node_ok else "FAIL"
-            if not node_ok:
-                failed.append("probe_obsidian_plugin.js")
-                for line in (proc.stdout or "").splitlines():
-                    if "FAIL" in line:
-                        print(f"  {line.strip()}")
-        except (OSError, subprocess.SubprocessError) as exc:
-            node_status = f"SKIP（{exc}）"
-    elif not args.filter:
-        node_status = "SKIP（未找到 node）"
-
     print("\n" + "=" * 78)
-    total_cases = len(results) + (1 if node_status.startswith(("PASS", "FAIL")) else 0)
-    if node_status.startswith("PASS"):
-        passed += 1
-    print(f"汇总: {passed}/{total_cases} 通过，用时 {total:.1f}s")
+    print(f"汇总: {passed}/{len(results)} 通过，用时 {total:.1f}s")
     for name, ok, elapsed, _detail in results:
         print(f"  {'PASS' if ok else 'FAIL'}  {name:24s} {elapsed:6.1f}s")
-    if node_status:
-        print(f"  {node_status:5s} probe_obsidian_plugin.js")
     if failed:
         print("\n失败用例: " + ", ".join(failed))
     if missing:

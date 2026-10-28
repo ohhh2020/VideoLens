@@ -1,0 +1,74 @@
+/* 使用虚构密钥验证固定遮罩、显隐、编辑、清除及异步读取边界。 */
+"use strict";
+const assert=require("node:assert/strict"),fs=require("node:fs"),path=require("node:path");
+const {JSDOM}=require("jsdom"),root=path.resolve(__dirname,"..");
+async function main(){
+  const dom=new JSDOM(fs.readFileSync(path.join(root,"frontend/workbench/index.html"),"utf8"),{url:"http://127.0.0.1:8000/ui",runScripts:"outside-only"});
+  const w=dom.window,$=selector=>w.document.querySelector(selector);
+  const keys={"llm.cloud.api_key":"sk-example-short","vl.cloud_api_key":"sk-example-a-much-longer-credential-123456"};
+  const requests=[];let fail=false,release=null,pending=false;
+  w.fetch=async(url,options)=>{
+    requests.push({url,options});
+    if(pending)await new Promise(resolve=>{release=resolve});
+    return {ok:!fail,json:async()=>({value:keys[JSON.parse(options.body).key]})};
+  };
+  w.eval(fs.readFileSync(path.join(root,"frontend/workbench/keys.js"),"utf8"));
+  const settings={secret_present:Object.fromEntries(Object.keys(keys).map(key=>[key,true]))};
+  const input=(prefix,value)=>{const field=$(`#${prefix}_key`);field.value=value;field.dispatchEvent(new w.Event("input"))};
+  const payload=()=>{const result={};w.VideoLensKeys.append(result);return result};
+  w.VideoLensKeys.load(settings);
+  for(const prefix of ["llm","vl"]){
+    assert.equal($(`#${prefix}_key`).value,"");
+    assert.equal($(`#${prefix}_key`).type,"password");
+    assert.equal($(`#${prefix}_key_mask`).hidden,false);
+    assert.equal($(`#${prefix}_key_mask`).textContent,"●".repeat(8));
+    assert.equal($(`#${prefix}_key_toggle`).textContent,"显示");
+    assert.equal($(`#${prefix}_key`).placeholder,"");
+  }
+  assert.equal(requests.length,0,"默认不读取明文密钥");
+  assert.deepEqual(payload(),{},"固定圆点不会作为密钥提交");
+  await $("#llm_key_toggle").onclick();
+  assert.equal($("#llm_key").value,keys["llm.cloud.api_key"]);
+  assert.equal($("#llm_key").type,"text");
+  assert.equal($("#llm_key_mask").hidden,true);
+  assert.equal($("#vl_key").type,"password","两个密钥独立显隐");
+  assert.deepEqual(payload(),{},"只查看密钥不会覆盖配置或固化环境变量");
+  await $("#llm_key_toggle").onclick();
+  assert.equal($("#llm_key").value,"");
+  assert.equal($("#llm_key_mask").hidden,false);
+  input("llm","sk-new-example");
+  assert.equal($("#llm_key_mask").textContent,"●".repeat(8));
+  $("#llm_clear_key").checked=true;
+  assert.deepEqual(payload(),{"llm.cloud.api_key":"sk-new-example"},"新密钥优先于清除选项");
+  const before=requests.length;
+  await $("#llm_key_toggle").onclick();
+  assert.equal(requests.length,before,"正在编辑时显示输入值，不覆盖为旧密钥");
+  assert.equal($("#llm_key").value,"sk-new-example");
+  w.VideoLensKeys.hide();
+  assert.equal($("#llm_key").value,"sk-new-example","隐藏保留未保存编辑");
+  input("llm","");
+  assert.deepEqual(payload(),{"llm.cloud.api_key":""});
+  w.VideoLensKeys.load(settings);
+  fail=true;
+  await $("#vl_key_toggle").onclick();
+  assert.equal($("#vl_key").type,"password");
+  assert.equal($("#vl_key_toggle").disabled,false);
+  assert.ok($("#saveSetHint").textContent.includes("无法显示"));
+  fail=false;pending=true;
+  const waiting=$("#llm_key_toggle").onclick();
+  w.VideoLensKeys.hide();release();await waiting;
+  assert.equal($("#llm_key").value,"");
+  assert.equal($("#llm_key").type,"password","离开页面后晚到的读取不能重新显示");
+  const editing=$("#vl_key_toggle").onclick();
+  input("vl","sk-typed-during-request");release();await editing;
+  assert.equal($("#vl_key").value,"sk-typed-during-request");
+  pending=false;
+  w.VideoLensKeys.load({secret_present:{}});
+  assert.equal($("#llm_key_mask").hidden,true);
+  assert.ok($("#llm_key").placeholder.includes("请输入"));
+  const css=fs.readFileSync(path.join(root,"frontend/workbench/style.css"),"utf8");
+  assert.match(css,/\.key-hidden input\{color:transparent;caret-color:transparent\}/,"原生密码字符不显示真实长度");
+  dom.window.close();
+  console.log("PASS：默认固定实心圆点、按需显示、独立隐藏、保存/清除与异步边界");
+}
+main().catch(error=>{console.error(error);process.exitCode=1});

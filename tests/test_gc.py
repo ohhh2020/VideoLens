@@ -18,7 +18,6 @@ import os
 import sys
 import tempfile
 import time
-import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -27,8 +26,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from core.config import load_app_config  # noqa: E402
-from core.storage.repository import SqliteRepository  # noqa: E402
+from backend.config import load_app_config  # noqa: E402
+from backend.storage.repository import SqliteRepository  # noqa: E402
 from scripts.gc import (  # noqa: E402
     Outcome,
     Plan,
@@ -86,7 +85,9 @@ class FakeOrch:
         doomed = self.repository.delete_video(video_id)
         return {"db": doomed, "files": self.purge_files(video_id, doomed)}
 
-    def purge_files(self, video_id: str, paths: Any = (), **kwargs: Any) -> dict[str, int]:  # noqa: ANN401
+    def purge_files(
+        self, video_id: str, paths: Any = (), **kwargs: Any
+    ) -> dict[str, int]:  # noqa: ANN401
         self.purged.append((video_id, tuple(str(p) for p in paths)))
         return {"files": len(tuple(paths))}
 
@@ -130,8 +131,12 @@ def main() -> int:
     check("汉字宽度 2", _width("中文") == 4, _width("中文"))
     check("混排宽度", _width("a中b") == 4, _width("a中b"))
     check("左对齐补到 10 列", _width(_pad("视频", 10)) == 10, _width(_pad("视频", 10)))
-    check("右对齐补到 10 列", _width(_rpad("2 条", 10)) == 10, _width(_rpad("2 条", 10)))
-    check("超长不截断", _pad("一二三四五六", 4) == "一二三四五六", _pad("一二三四五六", 4))
+    check(
+        "右对齐补到 10 列", _width(_rpad("2 条", 10)) == 10, _width(_rpad("2 条", 10))
+    )
+    check(
+        "超长不截断", _pad("一二三四五六", 4) == "一二三四五六", _pad("一二三四五六", 4)
+    )
 
     # -- 3. 时间窗口 -------------------------------------------------------
     print("\n[3] 时间窗口")
@@ -141,8 +146,16 @@ def main() -> int:
     check("ISO 含毫秒", "." in iso, iso)
     check("带 UTC 时区", datetime.fromisoformat(iso).utcoffset() == timedelta(0), iso)
     parsed = datetime.fromisoformat(iso).timestamp()
-    check("30 天前误差 <2 分钟", abs((now - 30 * 86400) - parsed) < 120, round(now - parsed))
-    check("0 天约等于现在", abs(now - datetime.fromisoformat(_iso_before(days=0)).timestamp()) < 120, "")
+    check(
+        "30 天前误差 <2 分钟",
+        abs((now - 30 * 86400) - parsed) < 120,
+        round(now - parsed),
+    )
+    check(
+        "0 天约等于现在",
+        abs(now - datetime.fromisoformat(_iso_before(days=0)).timestamp()) < 120,
+        "",
+    )
     check("与库内格式一致", iso.endswith("+00:00"), iso)
 
     # -- 4. 临时文件挑选 ---------------------------------------------------
@@ -160,7 +173,9 @@ def main() -> int:
     os.utime(old, (past, past))
     os.utime(sub, (past, past))
     stale = _stale_files(temp_root, time.time() - 3600)
-    check("只挑过期文件", [p.name for p in stale] == ["old.tmp"], [p.name for p in stale])
+    check(
+        "只挑过期文件", [p.name for p in stale] == ["old.tmp"], [p.name for p in stale]
+    )
     check("目录不算", all(p.is_file() for p in stale), "")
     check("体积累加", _size_of(stale) == 100, _size_of(stale))
     check("空列表体积为 0", _size_of([]) == 0, _size_of([]))
@@ -171,7 +186,9 @@ def main() -> int:
         ignore_user_settings=True,
         overrides={"paths": {"temp": str(temp_root), "exports": str(work / "exports")}},
     )
-    check("配置指向测试目录", Path(config.path("temp")) == temp_root, config.path("temp"))
+    check(
+        "配置指向测试目录", Path(config.path("temp")) == temp_root, config.path("temp")
+    )
 
     # -- 5. 过期视频挑选 ---------------------------------------------------
     print("\n[5] 过期视频只挑 ready")
@@ -182,9 +199,17 @@ def main() -> int:
     seed(repo, vid="v-failed", status="failed", finished="2020-01-01T00:00:00.000Z")
 
     expired = repo.expired_videos(finished_before=_iso_before(days=30))
-    check("只返回 ready", [v.video_id for v in expired] == ["v-old"], [v.video_id for v in expired])
+    check(
+        "只返回 ready",
+        [v.video_id for v in expired] == ["v-old"],
+        [v.video_id for v in expired],
+    )
     check("空时间串不返回", repo.expired_videos(finished_before="") == [], "")
-    check("limit 生效", len(repo.expired_videos(finished_before=_iso_before(days=30), limit=0)) <= 1, "")
+    check(
+        "limit 生效",
+        len(repo.expired_videos(finished_before=_iso_before(days=30), limit=0)) <= 1,
+        "",
+    )
 
     orch = FakeOrch(repo)
 
@@ -192,14 +217,28 @@ def main() -> int:
     print("\n[6] 计划构建")
     plan = build_plan(config, orch, ttl_days=30, temp_hours=1, orphan_days=30)  # type: ignore[arg-type]
     check("plan 是 Plan", isinstance(plan, Plan), type(plan).__name__)
-    check("挑出 1 条过期视频", [v.video_id for v in plan.videos] == ["v-old"], [v.video_id for v in plan.videos])
-    check("挑出 1 个过期临时文件", [p.name for p in plan.temp] == ["old.tmp"], [p.name for p in plan.temp])
+    check(
+        "挑出 1 条过期视频",
+        [v.video_id for v in plan.videos] == ["v-old"],
+        [v.video_id for v in plan.videos],
+    )
+    check(
+        "挑出 1 个过期临时文件",
+        [p.name for p in plan.temp] == ["old.tmp"],
+        [p.name for p in plan.temp],
+    )
     check("非空", plan.empty is False, "")
     check("有说明文字", bool(plan.notes), plan.notes)
 
     plan_zero = build_plan(config, orch, ttl_days=0, temp_hours=99999, orphan_days=0)  # type: ignore[arg-type]
-    check("ttl=0 不删视频", plan_zero.videos == [], [v.video_id for v in plan_zero.videos])
-    check("无项目时 empty", plan_zero.empty is True, (plan_zero.temp, plan_zero.orphans, plan_zero.videos))
+    check(
+        "ttl=0 不删视频", plan_zero.videos == [], [v.video_id for v in plan_zero.videos]
+    )
+    check(
+        "无项目时 empty",
+        plan_zero.empty is True,
+        (plan_zero.temp, plan_zero.orphans, plan_zero.videos),
+    )
 
     text = render_plan(plan, dry_run=True)
     check("渲染含视频标题", "片 v-old" in text, text[:200])
@@ -216,12 +255,21 @@ def main() -> int:
     check("临时文件真的没了", not old.exists(), old)
     check("新文件还在", fresh.exists(), fresh)
     check("库记录已删", repo.find_video("v-old") is None, "")
-    check("其他视频未动", repo.find_video("v-running") is not None and repo.find_video("v-new") is not None, "")
+    check(
+        "其他视频未动",
+        repo.find_video("v-running") is not None
+        and repo.find_video("v-new") is not None,
+        "",
+    )
     check("ok 为真", outcome.ok is True, outcome.failed)
 
     # 重复执行必须是空操作（幂等）。
     again = apply_plan(build_plan(config, orch, ttl_days=30, temp_hours=1), orch)  # type: ignore[arg-type]
-    check("二次执行空操作", again.videos == 0 and again.temp == 0, (again.videos, again.temp))
+    check(
+        "二次执行空操作",
+        again.videos == 0 and again.temp == 0,
+        (again.videos, again.temp),
+    )
 
     # -- 8. 失败不中断 -----------------------------------------------------
     print("\n[8] 单条失败不中断")
@@ -234,7 +282,9 @@ def main() -> int:
     check("计划含两条", len(plan2.videos) == 2, len(plan2.videos))
     out2 = apply_plan(plan2, orch2)  # type: ignore[arg-type]
     check("成功一条", out2.videos == 1, out2.videos)
-    check("失败被记录", len(out2.failed) == 1 and "v-bad" in out2.failed[0], out2.failed)
+    check(
+        "失败被记录", len(out2.failed) == 1 and "v-bad" in out2.failed[0], out2.failed
+    )
     check("失败时 ok 为假", out2.ok is False, out2.ok)
     check("另一条仍被删", repo2.find_video("v-good") is None, "")
 

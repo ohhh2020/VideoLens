@@ -81,18 +81,46 @@ def main() -> int:
     check("去标点", _fold("你好，世界！") == "你好世界", _fold("你好，世界！"))
     check("全角转半角", _fold("ＡＢＣ１２３") == "abcn", _fold("ＡＢＣ１２３"))
     check("阿拉伯数字折成 n", _fold("共 2048 个") == "共n个", _fold("共 2048 个"))
-    check("中文数字折成 n", _fold("共两千零四十八个") == "共n个", _fold("共两千零四十八个"))
-    check("数字不归一化时保留", _fold("共 2048 个", numbers=False) == "共2048个", _fold("共 2048 个", numbers=False))
+    check(
+        "中文数字折成 n",
+        _fold("共两千零四十八个") == "共n个",
+        _fold("共两千零四十八个"),
+    )
+    check(
+        "数字不归一化时保留",
+        _fold("共 2048 个", numbers=False) == "共2048个",
+        _fold("共 2048 个", numbers=False),
+    )
     check("空白被去掉", _fold("a b\tc") == "abc", _fold("a b\tc"))
     check("引号被去掉", _fold('他说"好"') == "他说好", _fold('他说"好"'))
 
     # -- 3. 分词 -----------------------------------------------------------
     print("\n[3] 分词")
-    check("中文逐字", tokenize("你好世界", cjk=True) == ["你", "好", "世", "界"], tokenize("你好世界", cjk=True))
-    check("中文忽略标点", tokenize("你好，世界。", cjk=True) == ["你", "好", "世", "界"], tokenize("你好，世界。", cjk=True))
-    check("英文按词切", tokenize("hello big world", cjk=False) == ["hello", "big", "world"], tokenize("hello big world", cjk=False))
-    check("英文词内撇号保留", tokenize("don't stop", cjk=False) == ["don't", "stop"], tokenize("don't stop", cjk=False))
-    check("英文数字折成 n", tokenize("about 2048 items", cjk=False) == ["about", "n", "items"], tokenize("about 2048 items", cjk=False))
+    check(
+        "中文逐字",
+        tokenize("你好世界", cjk=True) == ["你", "好", "世", "界"],
+        tokenize("你好世界", cjk=True),
+    )
+    check(
+        "中文忽略标点",
+        tokenize("你好，世界。", cjk=True) == ["你", "好", "世", "界"],
+        tokenize("你好，世界。", cjk=True),
+    )
+    check(
+        "英文按词切",
+        tokenize("hello big world", cjk=False) == ["hello", "big", "world"],
+        tokenize("hello big world", cjk=False),
+    )
+    check(
+        "英文词内撇号保留",
+        tokenize("don't stop", cjk=False) == ["don't", "stop"],
+        tokenize("don't stop", cjk=False),
+    )
+    check(
+        "英文数字折成 n",
+        tokenize("about 2048 items", cjk=False) == ["about", "n", "items"],
+        tokenize("about 2048 items", cjk=False),
+    )
     check("空串切出空表", tokenize("", cjk=True) == [], "")
 
     # -- 4. 错误计数 -------------------------------------------------------
@@ -121,7 +149,10 @@ def main() -> int:
         tokenize("共2048个", cjk=True, numbers=False),
         tokenize("共两千零四十八个", cjk=True, numbers=False),
     )
-    folded = align(tokenize(_fold("共2048个"), cjk=True), tokenize(_fold("共两千零四十八个"), cjk=True))
+    folded = align(
+        tokenize(_fold("共2048个"), cjk=True),
+        tokenize(_fold("共两千零四十八个"), cjk=True),
+    )
     check("不归一化会算错", plain.count > 0, plain.to_dict())
     check("归一化后算对", folded.count == 0, folded.to_dict())
 
@@ -138,14 +169,34 @@ def main() -> int:
     check("句级句数", len(whole) == 3, len(whole))
 
     partial = score_sentences(ref, "第一句在这里。第三句在这里。")
-    check("漏一句记删除", sum(r.errors.delete for r in partial) > 0, [(r.reference, r.hypothesis) for r in partial])
+    check(
+        "漏一句记删除",
+        sum(r.errors.delete for r in partial) > 0,
+        [(r.reference, r.hypothesis) for r in partial],
+    )
     check("句级仍有 3 条参考", len(partial) == 3, len(partial))
-    check("漏掉的那句被标出", any(not row.hypothesis for row in partial), [row.hypothesis for row in partial])
+    check(
+        "漏掉的那句被标出",
+        any(not row.hypothesis for row in partial),
+        [row.hypothesis for row in partial],
+    )
 
-    check("分句按中文句号", split_sentences("甲。乙！丙？") == ["甲。", "乙！", "丙？"], split_sentences("甲。乙！丙？"))
+    check(
+        "分句按中文句号",
+        split_sentences("甲。乙！丙？") == ["甲。", "乙！", "丙？"],
+        split_sentences("甲。乙！丙？"),
+    )
     # 英文句号不切是有意的：小数点、缩写、版本号都会被误切。
-    check("英文句号不切", split_sentences("a. b! c?") == ["a. b!", "c?"], split_sentences("a. b! c?"))
-    check("英文感叹号切", split_sentences("one! two!") == ["one!", "two!"], split_sentences("one! two!"))
+    check(
+        "英文句号不切",
+        split_sentences("a. b! c?") == ["a. b!", "c?"],
+        split_sentences("a. b! c?"),
+    )
+    check(
+        "英文感叹号切",
+        split_sentences("one! two!") == ["one!", "two!"],
+        split_sentences("one! two!"),
+    )
     check("空串分句为空", split_sentences("") == [], "")
 
     # -- 6. 参考文本读取 ---------------------------------------------------
@@ -153,15 +204,23 @@ def main() -> int:
     work = tmpdir()
     plain_path = work / "ref.txt"
     plain_path.write_text("第一句。第二句。", encoding="utf-8")
-    check("UTF-8 文本", load_reference(plain_path) == "第一句。第二句。", load_reference(plain_path))
+    check(
+        "UTF-8 文本",
+        load_reference(plain_path) == "第一句。第二句。",
+        load_reference(plain_path),
+    )
 
     bom_path = work / "bom.txt"
     bom_path.write_text("带 BOM 的文本。", encoding="utf-8-sig")
-    check("UTF-8 BOM 文本", "带 BOM" in load_reference(bom_path), load_reference(bom_path))
+    check(
+        "UTF-8 BOM 文本", "带 BOM" in load_reference(bom_path), load_reference(bom_path)
+    )
 
     gb_path = work / "gb.txt"
     gb_path.write_bytes("国标编码。".encode("gb18030"))
-    check("GB18030 兜底", load_reference(gb_path) == "国标编码。", load_reference(gb_path))
+    check(
+        "GB18030 兜底", load_reference(gb_path) == "国标编码。", load_reference(gb_path)
+    )
 
     srt_path = work / "ref.srt"
     srt_path.write_text(
@@ -176,7 +235,11 @@ def main() -> int:
     # -- 7. 报告 -----------------------------------------------------------
     print("\n[7] 报告与判定")
     ok_report = Report(unit="字", reference_len=100, errors=Errors(5, 0, 0, 100))
-    check("5% 及格", "达标" in ok_report.verdict() and "未达标" not in ok_report.verdict(), ok_report.verdict())
+    check(
+        "5% 及格",
+        "达标" in ok_report.verdict() and "未达标" not in ok_report.verdict(),
+        ok_report.verdict(),
+    )
     check("rate 5%", abs(ok_report.rate - 0.05) < 1e-9, ok_report.rate)
 
     bad_report = Report(unit="字", reference_len=100, errors=Errors(30, 0, 0, 100))
@@ -187,23 +250,40 @@ def main() -> int:
     check("WER 标签", "WER" in word_report.verdict(), word_report.verdict())
     check("CER 标签", "CER" in bad_report.verdict(), bad_report.verdict())
 
-    check("空报告 rate 0", Report(unit="字", reference_len=0, errors=Errors()).rate == 0.0, "")
-    check("to_dict 可序列化", isinstance(ok_report.to_dict(), dict), type(ok_report.to_dict()).__name__)
-    check("to_dict 含 verdict", "verdict" in ok_report.to_dict(),
-          str(ok_report.to_dict())[:80])
+    check(
+        "空报告 rate 0",
+        Report(unit="字", reference_len=0, errors=Errors()).rate == 0.0,
+        "",
+    )
+    check(
+        "to_dict 可序列化",
+        isinstance(ok_report.to_dict(), dict),
+        type(ok_report.to_dict()).__name__,
+    )
+    check(
+        "to_dict 含 verdict",
+        "verdict" in ok_report.to_dict(),
+        str(ok_report.to_dict())[:80],
+    )
 
     ranked = Report(
         unit="字",
         reference_len=20,
         errors=Errors(6, 0, 0, 20),
         sentences=[
-            SentenceScore("完全正确的句子在这里", "完全正确的句子在这里", Errors(0, 0, 0, 10)),
+            SentenceScore(
+                "完全正确的句子在这里", "完全正确的句子在这里", Errors(0, 0, 0, 10)
+            ),
             SentenceScore("这句差得比较多一些", "这句完全不同", Errors(7, 0, 0, 9)),
             SentenceScore("这句中等", "这句中", Errors(1, 0, 0, 4)),
         ],
     )
     worst = ranked.worst
-    check("worst 返回最差句", bool(worst) and worst[0].reference.startswith("这句差得"), worst[0].reference if worst else None)
+    check(
+        "worst 返回最差句",
+        bool(worst) and worst[0].reference.startswith("这句差得"),
+        worst[0].reference if worst else None,
+    )
     check("worst 只含有错的句", len(worst) == 2, [s.reference for s in worst])
 
     out = render(ranked, top=2)

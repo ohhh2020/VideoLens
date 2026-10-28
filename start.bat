@@ -1,29 +1,37 @@
 @echo off
-rem ===================================================================
-rem  ZhiYing launcher shell.
-rem  This file is intentionally pure ASCII: cmd.exe parses .bat files with
-rem  the system ANSI code page, so non-ASCII text here corrupts the script.
-rem  All real logic and Chinese UI text live in start.ps1 (UTF-8 BOM).
-rem ===================================================================
 setlocal
+"%SystemRoot%\System32\chcp.com" 65001 >nul
 cd /d "%~dp0"
-
-set "PSH=powershell.exe"
-where /q pwsh.exe && set "PSH=pwsh.exe"
-
-rem --- BOM guard ---------------------------------------------------
-rem  Windows PowerShell 5.1 decodes a BOM-less .ps1 with the ANSI code
-rem  page and then reports bogus parser errors, so re-add the BOM if it
-rem  ever goes missing (editors drop it silently). ASCII-only on purpose.
-"%PSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$p = Join-Path '%~dp0' 'start.ps1'; if (Test-Path -LiteralPath $p) { $b = [IO.File]::ReadAllBytes($p); if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) { exit 0 }; $t = [IO.File]::ReadAllText($p, [Text.Encoding]::UTF8); [IO.File]::WriteAllText($p, $t, (New-Object Text.UTF8Encoding $true)) }" >nul 2>&1
-
-"%PSH%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0start.ps1" %*
-set "RC=%ERRORLEVEL%"
-
-if not "%RC%"=="0" (
-    echo.
-    echo   [launcher] exited with code %RC%
-    pause
+if "%~1"=="--help" goto help
+if "%~1"=="-h" goto help
+if not defined CONDA_PREFIX (
+  echo 请先运行 conda activate VideoLens，再启动网页。
+  exit /b 2
 )
-endlocal
-exit /b %RC%
+set "VIDEOLENS_PYTHON=%CONDA_PREFIX%\python.exe"
+if not exist "%VIDEOLENS_PYTHON%" (
+  echo 当前激活的 Conda 环境中找不到 python.exe。
+  exit /b 2
+)
+if not defined VIDEOLENS_RUNTIME_ROOT set "VIDEOLENS_RUNTIME_ROOT=%~dp0..\VideoLens-runtime"
+set "PYTHONNOUSERSITE=1"
+set "PYTHONHOME="
+set "PYTHONPATH=%~dp0"
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+set "PYTHONPYCACHEPREFIX=%VIDEOLENS_RUNTIME_ROOT%\cache\pycache"
+"%VIDEOLENS_PYTHON%" -c "import sys; sys.exit(0 if sys.version_info[:2] == (3,13) else 2)"
+if errorlevel 1 (
+  echo 当前环境必须使用 Python 3.13，请检查 conda activate 的环境。
+  exit /b 2
+)
+"%VIDEOLENS_PYTHON%" -m backend.web.console %*
+exit /b %ERRORLEVEL%
+
+:help
+echo 用法：先 conda activate VideoLens，再运行 start.bat [--host 本机地址] [--port 8000] [--reload]
+echo --host: 可选 127.0.0.1、localhost、::1
+echo --port: 网页服务端口
+echo --reload: 开发时自动重载
+echo 启动后可输入 help、status、stop、restart；Ctrl+C 也可关闭。
+exit /b 0

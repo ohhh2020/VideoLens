@@ -36,9 +36,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.config import AppConfig, ConfigError, get_app_config  # noqa: E402
-from core.pipeline.orchestrator import Orchestrator  # noqa: E402
-from core.storage.repository import StorageError  # noqa: E402
+from backend.config import AppConfig, ConfigError, get_app_config  # noqa: E402
+from backend.pipeline.orchestrator import Orchestrator  # noqa: E402
+from backend.storage.repository import StorageError  # noqa: E402
 
 logger = logging.getLogger("zhiying.gc")
 
@@ -123,7 +123,9 @@ def _size_of(paths: list[Path]) -> int:
 
 def _width(text: str) -> int:
     """终端显示宽度：中日韩全角字符占 2 列。"""
-    return sum(2 if unicodedata.east_asian_width(ch) in {"W", "F"} else 1 for ch in text)
+    return sum(
+        2 if unicodedata.east_asian_width(ch) in {"W", "F"} else 1 for ch in text
+    )
 
 
 def _pad(text: str, width: int) -> str:
@@ -197,15 +199,21 @@ def build_plan(
         except StorageError as exc:
             plan.notes.append(f"孤儿关键帧：查询失败（{exc}），跳过")
             candidates = []
-        plan.orphans = [p for p in candidates if p.is_file() and p.stat().st_mtime < cutoff]
+        plan.orphans = [
+            p for p in candidates if p.is_file() and p.stat().st_mtime < cutoff
+        ]
     else:
         plan.notes.append("孤儿关键帧：orphan_frames_days=0，跳过")
 
     ttl = retention.video_ttl_days if ttl_days is None else ttl_days
     if ttl > 0:
-        plan.videos = orch.repository.expired_videos(finished_before=_iso_before(days=ttl))
+        plan.videos = orch.repository.expired_videos(
+            finished_before=_iso_before(days=ttl)
+        )
         if plan.videos:
-            plan.notes.append(f"视频 TTL：完成超过 {ttl} 天的记录 {len(plan.videos)} 条")
+            plan.notes.append(
+                f"视频 TTL：完成超过 {ttl} 天的记录 {len(plan.videos)} 条"
+            )
     else:
         plan.notes.append("视频 TTL：video_ttl_days=0，跳过")
 
@@ -234,11 +242,15 @@ def _over_limit_videos(config: AppConfig, orch: Orchestrator) -> list[Any]:
         return []
     # 需要腾出的比例 → 换算成"删掉最老的一批"，按完成时间升序取够为止。
     need = worst - RECLAIM_TARGET
-    pool = orch.repository.expired_videos(finished_before=_iso_before(days=0), limit=10_000)
+    pool = orch.repository.expired_videos(
+        finished_before=_iso_before(days=0), limit=10_000
+    )
     if not pool:
         return []
     take = max(1, int(len(pool) * need / max(worst, 1e-6)))
-    logger.info("容量水位 %.0f%%，计划回收 %d 条（%d 条可选）", worst * 100, take, len(pool))
+    logger.info(
+        "容量水位 %.0f%%，计划回收 %d 条（%d 条可选）", worst * 100, take, len(pool)
+    )
     return pool[:take]
 
 
@@ -304,7 +316,9 @@ def render_stats(config: AppConfig, orch: Orchestrator) -> str:
             cap = f" / {limit}" if limit else ""
             ratio = f"  {stats.usage(_TABLE_OF[key]) * 100:>5.1f}%" if limit else ""
             lines.append(f"  {_pad(label, 10)} {_rpad(str(count), 8)}{cap}{ratio}")
-        lines.append(f"  {_pad('关键帧体积', 10)} {_rpad(_human(stats.keyframe_bytes), 8)}")
+        lines.append(
+            f"  {_pad('关键帧体积', 10)} {_rpad(_human(stats.keyframe_bytes), 8)}"
+        )
         lines.append(f"  {_pad('数据库体积', 10)} {_rpad(_human(stats.db_bytes), 8)}")
     lines.append("")
     for tag in ("videos", "audio", "frames", "temp", "chroma", "exports"):
@@ -313,7 +327,9 @@ def render_stats(config: AppConfig, orch: Orchestrator) -> str:
             continue
         size = sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
         count = sum(1 for p in root.rglob("*") if p.is_file())
-        lines.append(f"  {_pad(tag, 10)} {_rpad(str(count), 7)} 文件  {_rpad(_human(size), 10)}")
+        lines.append(
+            f"  {_pad(tag, 10)} {_rpad(str(count), 7)} 文件  {_rpad(_human(size), 10)}"
+        )
     return "\n".join(lines)
 
 
@@ -321,15 +337,23 @@ def render_plan(plan: Plan, *, dry_run: bool) -> str:
     head = "知影 回收计划（预览，未改动任何数据）" if dry_run else "知影 回收计划"
     lines = [head, ""]
     if plan.temp:
-        lines.append(f"  临时文件      {len(plan.temp):>4} 个   {_human(plan.temp_bytes)}")
+        lines.append(
+            f"  临时文件      {len(plan.temp):>4} 个   {_human(plan.temp_bytes)}"
+        )
     if plan.orphans:
-        lines.append(f"  孤儿关键帧    {len(plan.orphans):>4} 张   {_human(plan.orphan_bytes)}")
+        lines.append(
+            f"  孤儿关键帧    {len(plan.orphans):>4} 张   {_human(plan.orphan_bytes)}"
+        )
     if plan.videos:
-        lines.append(f"  过期视频      {len(plan.videos):>4} 条   {_human(plan.video_bytes)}")
+        lines.append(
+            f"  过期视频      {len(plan.videos):>4} 条   {_human(plan.video_bytes)}"
+        )
         # 预览阶段就把标题列出来：删之前总得知道删的是哪几条。
         for video in plan.videos[:3]:
             name = (video.title or video.display_name or "").strip() or "(无标题)"
-            lines.append(f"    · {_pad(name, 24)}  {video.video_id}  {video.finished_at}")
+            lines.append(
+                f"    · {_pad(name, 24)}  {video.video_id}  {video.finished_at}"
+            )
         if len(plan.videos) > 3:
             lines.append(f"    · 其余 {len(plan.videos) - 3} 条略")
     if plan.empty:
@@ -355,8 +379,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="只列出计划，不删除")
     parser.add_argument("--stats", action="store_true", help="只显示当前占用")
     parser.add_argument("--ttl-days", type=int, default=None, help="覆盖视频保留天数")
-    parser.add_argument("--temp-hours", type=int, default=None, help="覆盖临时文件保留小时数")
-    parser.add_argument("--orphan-days", type=int, default=None, help="覆盖孤儿关键帧保留天数")
+    parser.add_argument(
+        "--temp-hours", type=int, default=None, help="覆盖临时文件保留小时数"
+    )
+    parser.add_argument(
+        "--orphan-days", type=int, default=None, help="覆盖孤儿关键帧保留天数"
+    )
     parser.add_argument(
         "--enforce-limits", action="store_true", help="容量触顶时按最久完成回收"
     )
@@ -379,7 +407,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
 
     try:
-        orch = Orchestrator.from_config(config, load_models=False)
+        orch = Orchestrator.from_config(config)
     except Exception as exc:  # noqa: BLE001 - 存储层起不来就没法清理
         print(f"初始化失败：{exc}", file=sys.stderr)
         return EXIT_USAGE

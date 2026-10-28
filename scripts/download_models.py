@@ -1,28 +1,4 @@
-#!/usr/bin/env python
-"""知影 (ZhiYing) —— 模型权重预下载 / 体检 CLI。
-
-用法示例::
-
-    # 查看清单（不联网）
-    python scripts/download_models.py --list
-
-    # 体检：本地有哪些、缺什么、多大（不联网）
-    python scripts/download_models.py --status
-
-    # 预下载全部模型（ModelScope 优先，失败回退 HuggingFace 镜像）
-    python scripts/download_models.py --all
-
-    # 只拉两个模型，并强制走 HuggingFace
-    python scripts/download_models.py --models bge-m3,qwen2.5-7b-gguf --source huggingface
-
-    # 逐文件哈希校验（需 models.yaml 中提供 sha256 才有意义）
-    python scripts/download_models.py --verify --models faster-whisper-large-v3
-
-    # 清理中断残留的下载暂存目录 + 删除某个模型
-    python scripts/download_models.py --prune --remove siglip2-base
-
-退出码: 0 = 全部成功；1 = 有模型失败/缺失；2 = 参数或配置错误。
-"""
+"""三个必需模型的下载、验证、状态与清理入口。"""
 
 from __future__ import annotations
 
@@ -38,7 +14,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from core.models.manager import (  # noqa: E402 - 必须在上面的 sys.path 注入之后
+from backend.models.manager import (  # noqa: E402 - 必须在上面的 sys.path 注入之后
     ModelManager,
     ModelManagerError,
     ModelSpec,
@@ -85,7 +61,9 @@ def _print_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
 
 
 def _spec_row(spec: ModelSpec) -> list[str]:
-    sources = ", ".join(f"{k}:{v.repo_id}@{v.revision}" for k, v in spec.sources.items())
+    sources = ", ".join(
+        f"{k}:{v.repo_id}@{v.revision}" for k, v in spec.sources.items()
+    )
     return [
         spec.name,
         spec.kind,
@@ -127,9 +105,15 @@ def _status_payload(status: ModelStatus) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # 动作
 # --------------------------------------------------------------------------- #
-def _resolve_targets(manager: ModelManager, args: argparse.Namespace) -> tuple[str, ...]:
+def _resolve_targets(
+    manager: ModelManager, args: argparse.Namespace
+) -> tuple[str, ...]:
     if args.models:
-        requested = [item.strip() for item in args.models.replace(",", " ").split() if item.strip()]
+        requested = [
+            item.strip()
+            for item in args.models.replace(",", " ").split()
+            if item.strip()
+        ]
         unknown = [name for name in requested if name not in manager.list_models()]
         if unknown:
             print(f"[ERROR] 未配置的模型: {', '.join(unknown)}", file=sys.stderr)
@@ -170,7 +154,9 @@ def action_list(manager: ModelManager, args: argparse.Namespace) -> int:
     print(f"配置文件 : {manager.config.config_path}")
     print(f"缓存目录 : {manager.cache_root}")
     print(f"下载顺序 : {' -> '.join(manager.config.network.sources_order)}")
-    print(f"HF 镜像  : {manager.config.network.hf_endpoint or 'https://huggingface.co'}")
+    print(
+        f"HF 镜像  : {manager.config.network.hf_endpoint or 'https://huggingface.co'}"
+    )
     print(f"设备探测 : {manager.device_hint}")
     print()
     _print_table(
@@ -184,7 +170,11 @@ def action_status(manager: ModelManager, args: argparse.Namespace) -> int:
     targets = _resolve_targets(manager, args)
     statuses = [manager.status(name, verify_hash=args.verify) for name in targets]
     if args.json:
-        print(json.dumps([_status_payload(s) for s in statuses], ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                [_status_payload(s) for s in statuses], ensure_ascii=False, indent=2
+            )
+        )
     else:
         _print_table(
             ["MODEL", "KIND", "REQ", "STATE", "SIZE", "SOURCE", "NOTE"],
@@ -196,7 +186,7 @@ def action_status(manager: ModelManager, args: argparse.Namespace) -> int:
         print(f"就绪 {ready}/{len(statuses)}，本地占用 {total_gb:.2f} GB")
     if args.verify:
         # --verify 时，必需的模型处于 CORRUPT 视为失败
-        corrupt = [s.name for s in statuses if s.state is ModelState.CORRUPT]
+        corrupt = [s.name for s in statuses if not s.available]
         return _EXIT_FAILED if corrupt else _EXIT_OK
     return _EXIT_OK
 
@@ -242,7 +232,8 @@ def action_download(manager: ModelManager, args: argparse.Namespace) -> int:
     required_failed = [
         name
         for name in failed
-        if manager.config.models.get(name) is not None and manager.config.models[name].required
+        if manager.config.models.get(name) is not None
+        and manager.config.models[name].required
     ]
     if args.json:
         print(
@@ -256,7 +247,7 @@ def action_download(manager: ModelManager, args: argparse.Namespace) -> int:
                 indent=2,
             )
         )
-    return _EXIT_OK if not required_failed else _EXIT_FAILED
+    return _EXIT_FAILED if failed else _EXIT_OK
 
 
 def action_remove(manager: ModelManager, args: argparse.Namespace) -> int:
@@ -288,27 +279,63 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--config", type=Path, default=None, help="models.yaml 路径")
-    parser.add_argument("--cache-root", type=Path, default=None, help="模型缓存根目录（覆盖配置）")
-    parser.add_argument("--models", type=str, default=None, help="模型名列表，逗号或空格分隔")
+    parser.add_argument(
+        "--cache-root", type=Path, default=None, help="模型缓存根目录（覆盖配置）"
+    )
+    parser.add_argument(
+        "--models", type=str, default=None, help="模型名列表，逗号或空格分隔"
+    )
     parser.add_argument("--all", action="store_true", help="处理全部模型（默认行为）")
-    parser.add_argument("--source", choices=("modelscope", "huggingface"), default=None,
-                        help="强制指定下载源；缺省按配置顺序回退")
-    parser.add_argument("--force", action="store_true", help="忽略本地已有目录，强制重新下载")
-    parser.add_argument("--verify", action="store_true", help="执行 sha256 校验（仅当配置了 sha256）")
-    parser.add_argument("--list", action="store_true", help="打印模型清单后退出（不联网）")
-    parser.add_argument("--status", action="store_true", help="打印本地状态后退出（不联网）")
+    parser.add_argument(
+        "--source",
+        choices=("modelscope", "huggingface"),
+        default=None,
+        help="强制指定下载源；缺省按配置顺序回退",
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="忽略本地已有目录，强制重新下载"
+    )
+    parser.add_argument(
+        "--verify", action="store_true", help="执行 sha256 校验（仅当配置了 sha256）"
+    )
+    parser.add_argument(
+        "--list", action="store_true", help="打印模型清单后退出（不联网）"
+    )
+    parser.add_argument(
+        "--status", action="store_true", help="打印本地状态后退出（不联网）"
+    )
     parser.add_argument("--remove", action="store_true", help="删除指定模型的本地文件")
-    parser.add_argument("--manifest-only", action="store_true", help="配合 --remove：只删 manifest")
+    parser.add_argument(
+        "--manifest-only", action="store_true", help="配合 --remove：只删 manifest"
+    )
     parser.add_argument("--prune", action="store_true", help="清理过期下载暂存目录")
-    parser.add_argument("--prune-hours", type=int, default=None, help="暂存目录保留时长（默认取配置）")
-    parser.add_argument("--keep-going", action="store_true", default=True,
-                        help="单个模型失败后继续处理其余模型（默认开启）")
-    parser.add_argument("--fail-fast", dest="keep_going", action="store_false",
-                        help="任一模型失败即停止")
+    parser.add_argument(
+        "--prune-hours", type=int, default=None, help="暂存目录保留时长（默认取配置）"
+    )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        default=True,
+        help="单个模型失败后继续处理其余模型（默认开启）",
+    )
+    parser.add_argument(
+        "--fail-fast",
+        dest="keep_going",
+        action="store_false",
+        help="任一模型失败即停止",
+    )
     parser.add_argument("--json", action="store_true", help="以 JSON 输出结果")
     parser.add_argument("--quiet", action="store_true", help="不显示进度条")
-    parser.add_argument("-v", "--verbose", action="count", default=0, help="日志级别（-v INFO, -vv DEBUG）")
-    parser.add_argument("--log-file", type=Path, default=None, help="额外写入轮转日志文件")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="日志级别（-v INFO, -vv DEBUG）",
+    )
+    parser.add_argument(
+        "--log-file", type=Path, default=None, help="额外写入轮转日志文件"
+    )
     return parser
 
 
