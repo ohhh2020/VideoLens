@@ -80,6 +80,9 @@ def create_ui_router(cfg: Any = None) -> APIRouter:
         caps = device_capabilities()
         return JSONResponse({
             "values": current_settings(app_cfg.root_dir),
+            "quality": {"integrity": asdict(fresh.integrity), "source_height": fresh.media.download.format_max_height,
+                        "regular_side": fresh.vl.max_image_side,
+                        "max_file_bytes": fresh.limits.max_file_bytes, "max_duration_ms": fresh.limits.max_duration_ms},
             "secret_present": {key: bool(value) for key, value in _configured_keys(fresh).items()},
             "effective": effective_settings(fresh, caps),
             "capabilities": caps,
@@ -133,10 +136,13 @@ def create_ui_router(cfg: Any = None) -> APIRouter:
         caps = device_capabilities()
         restart_required = any(
             getattr(fresh, key) != getattr(runtime_cfg, key)
-            for key in ("llm", "vl", "retrieval")
+            for key in ("llm", "vl")
         )
         return JSONResponse({
             "saved": True,
+            "quality": {"integrity": asdict(fresh.integrity), "source_height": fresh.media.download.format_max_height,
+                        "regular_side": fresh.vl.max_image_side,
+                        "max_file_bytes": fresh.limits.max_file_bytes, "max_duration_ms": fresh.limits.max_duration_ms},
             "values": saved_values,
             "secret_present": {key: bool(value) for key, value in _configured_keys(fresh).items()},
             "effective": effective_settings(fresh, caps),

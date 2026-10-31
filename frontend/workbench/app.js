@@ -10,8 +10,8 @@ function toast(msg){const t=$("#toast");t.textContent=msg;t.classList.add("show"
   clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove("show"),2600)}
 
 /* ---------- 页签 ---------- */
-$$(".tabs button").forEach(b=>b.onclick=()=>{
-  $$(".tabs button").forEach(x=>x.classList.toggle("on",x===b));
+$$(".tabs [data-t]").forEach(b=>b.onclick=()=>{
+  $$(".tabs [data-t]").forEach(x=>{x.classList.toggle("on",x===b);x.setAttribute("aria-pressed",String(x===b))});
   $$(".tabpane").forEach(p=>p.classList.toggle("on",p.id==="p-"+b.dataset.t));
   if(b.dataset.t==="library")loadLibrary();
   if(b.dataset.t==="status")loadStatus();
@@ -20,149 +20,19 @@ $$(".tabs button").forEach(b=>b.onclick=()=>{
   else window.VideoLensMemory?.pause();
 });
 
-/* ---------- 分析 ---------- */
-let taskWatcher=null,reportMode="user",lastTask=null;
-window.addEventListener("pagehide",()=>taskWatcher?.stop());
+/* ---------- 报告显示偏好：只切换展示，不重新分析 ---------- */
+let reportMode="user";
 function applyReportMode(mode){
   reportMode=mode==="detailed"?"detailed":"user";
   document.body.classList.toggle("user-mode",reportMode==="user");
-  if(lastTask)showResult(lastTask);
-  if(reportMode==="user"){
-    $("#analyzeHint").textContent="";
-    if(lastTask?.status==="done")$("#progText").textContent="分析完成";
-  }
+  window.VideoLensWorkspace?.render();
 }
-function reportMarkdown(rep){return reportMode==="user"?VideoLensMarkdown.userReport(rep.summary):rep.summary||"（暂无总结）"}
 $("#report_mode").onchange=()=>applyReportMode($("#report_mode").value);
 window.addEventListener("storage",event=>{
   if(event.key==="videolens.reportMode"&&["user","detailed"].includes(event.newValue)){
     applyReportMode(event.newValue);$("#report_mode").value=event.newValue;
   }
 });
-
-$("#go").onclick=async()=>{
-  const src=$("#src").value.trim();
-  if(!src){toast("请填写视频来源");return}
-  $("#go").disabled=true; $("#analyzeHint").textContent="已提交，排队中…";
-  $("#progWrap").style.display="block"; $("#prog").style.width="2%";
-  $("#progText").textContent="提交中…"; $("#resultCard").style.display="none";
-  try{
-    const r=await fetch("/internal/videos/analyze",{method:"POST",headers:HJ(),body:JSON.stringify({
-      source:src, title:$("#title").value.trim()||undefined,
-      language:$("#lang").value||undefined,
-      force:$("#force").checked, skip_vision:$("#skipVision").checked,
-      skip_summary:$("#skipSummary").checked, skip_vectors:$("#skipVectors").checked})});
-    if(!r.ok)throw new Error((await r.json()).detail||("HTTP "+r.status));
-    const {task_id}=await r.json();
-    $("#analyzeHint").textContent=reportMode==="detailed"?"task_id: "+task_id:"任务已提交";
-    taskWatcher?.stop();
-    taskWatcher=VideoLensProgress.watch(task_id,{onUpdate:t=>{
-      $("#prog").style.width=Math.round((t.progress||0)*100)+"%";
-      $("#progText").textContent=reportMode==="detailed"?(t.stage||"")+" — "+(t.message||"")+
-        (t.elapsed_ms?" · 已用 "+Math.round(t.elapsed_ms/1000)+"s":""):
-        (t.status==="done"?"分析完成":t.status==="failed"?"分析未完成":"正在分析视频…");
-      if(["done","failed","cancelled"].includes(t.status)){
-        $("#go").disabled=false;
-        showResult(t); loadLibrary();
-      }
-    },onError:error=>{
-      $("#go").disabled=false;
-      $("#progText").textContent="进度连接中断，任务可能仍在运行。可在视频库查看结果。";
-      toast(error.message);
-    }});
-  }catch(e){
-    $("#go").disabled=false;$("#progText").textContent="提交失败："+e.message;toast("提交失败")
-  }
-};
-let lastReport=null;
-function showResult(t){
-  const rep=t.report||{};
-  lastTask=t;lastReport=rep;
-  $("#resultCard").style.display="block";
-  $("#transcriptBox").style.display="none";
-  $("#transcriptBody").textContent="";
-  $("#transcriptMeta").textContent="";
-  $("#toggleTranscript").textContent="📝 转写结果";
-  $("#toggleTranscript").hidden=reportMode==="user";
-  const noTranscript=Number(rep.segment_count||0)===0;
-  const notices=[...(rep.degraded||[]),...(rep.warnings||[])];
-  $("#resultTitle").textContent=reportMode==="user"?(t.status==="done"?"分析完成":"分析未完成"):t.status!=="done"?"❌ 分析未完成":
-    noTranscript?"⚠️ 分析结束，未生成转写文字":
-    (rep.degraded||[]).length?"⚠️ 分析完成（部分功能降级）":
-    (rep.warnings||[]).length?"✅ 分析完成（有提示）":"✅ 分析完成";
-  if(t.status==="failed"){$("#resultBody").innerHTML='<span style="color:var(--bad)">'+esc(t.error||"未知错误")+"</span>";return}
-  if(rep.video_id)$("#goChat").href="/chat?video_id="+encodeURIComponent(rep.video_id);
-  if(reportMode==="user"){
-    $("#resultBody").innerHTML='<div class="markdown-body">'+VideoLensMarkdown.render(reportMarkdown(rep))+'</div>';
-    return;
-  }
-  const rows=[["video_id",rep.video_id],["标题",rep.title],["时长",hms(rep.duration_ms)],
-    ["切片",rep.clip_count],["关键帧",rep.keyframe_count],["向量",rep.vector_count],
-    ["转写段数",rep.segment_count||0],["转录来源",rep.transcript_source||"-"],["语言",rep.language||"-"]];
-  $("#resultBody").innerHTML=rows.map(([k,v])=>`<div><b>${k}</b>  ${esc(String(v??"-"))}</div>`).join("")
-    +(noTranscript?'<div style="color:var(--bad);margin-top:8px">未生成语音转写文字，请检查下方转写提示；文本、视觉 API 配置不替代本地语音识别模型。</div>':"")
-    +(notices.length?'<div style="margin-top:8px;color:var(--warn)"><b>分析提示</b><ul>'+[...new Set(notices)].map(n=>`<li>${esc(String(n))}</li>`).join("")+'</ul></div>':"")
-    +(rep.summary?`<div class="markdown-body" style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px">${VideoLensMarkdown.render(rep.summary)}</div>`:"");
-  if(rep.video_id)$("#goChat").href="/chat?video_id="+rep.video_id;
-}
-$("#exportMd").onclick=async e=>{
-  e.preventDefault();
-  const rep=lastReport;if(!rep||!rep.video_id)return;
-  if(reportMode==="user"){
-    downloadReport(rep,reportMarkdown(rep));return;
-  }
-  let transcriptText="";
-  try{
-    const r=await fetch(`/internal/videos/${rep.video_id}/transcript`,{headers:H()});
-    if(r.ok){
-      const d=await r.json();
-      transcriptText=(d.segments||[]).map(s=>`[${hms(s.start_ms)}] ${s.text}`).join("\n");
-    }
-  }catch(err){/* 转写拉取失败不阻断导出 */}
-  const md=["# "+(rep.title||rep.video_id),
-    "",
-    `- 时长：${hms(rep.duration_ms)}`,
-    `- 语言：${rep.language||"-"} · 转录来源：${rep.transcript_source||"-"}`,
-    `- 切片 ${rep.clip_count||0} 个 · 关键帧 ${rep.keyframe_count||0} 个 · 向量 ${rep.vector_count||0} 条`,
-    "",
-    "## 综合总结","",
-    (rep.summary||"（无）").trim(),"",
-    "## 语音转写全文","",
-    transcriptText||"（无转写内容）"
-  ].join("\n");
-  downloadReport(rep,md);
-};
-function downloadReport(rep,md){
-  const blob=new Blob([md],{type:"text/markdown;charset=utf-8"});
-  const url=URL.createObjectURL(blob);
-  const a=document.createElement("a");
-  a.href=url;a.download=(rep.title||rep.video_id).replace(/[\\/:*?"<>|]/g,"")+".md";a.click();
-  URL.revokeObjectURL(url);toast("已导出 Markdown");
-};
-$("#toggleTranscript").onclick=async e=>{
-  e.preventDefault();
-  const rep=lastReport;if(!rep||!rep.video_id||reportMode==="user")return;
-  const box=$("#transcriptBox");
-  if(box.style.display==="none"){
-    if(!$("#transcriptBody").innerText.trim()){
-      $("#transcriptBody").textContent="加载中…";
-      try{
-        const r=await fetch(`/internal/videos/${rep.video_id}/transcript`,{headers:H()});
-        if(!r.ok){$("#transcriptBody").textContent="转写结果加载失败（"+r.status+"）"}
-        else{
-          const d=await r.json();
-          $("#transcriptMeta").textContent=`${d.count} 段 · ${d.language||"-"}`;
-          $("#transcriptBody").innerHTML=(d.segments||[]).map(s=>
-            `<div><span style="color:var(--accent);font-family:monospace">${hms(s.start_ms)}</span> ${esc(s.text)}</div>`
-          ).join("")||"（无转写内容）";
-        }
-      }catch(err){$("#transcriptBody").textContent="加载失败："+err}
-    }
-    box.style.display="block";$("#toggleTranscript").textContent="📝 收起转写";
-  }else{
-    box.style.display="none";$("#toggleTranscript").textContent="📝 转写结果";
-  }
-};
 
 /* ---------- 视频库 ---------- */
 async function loadLibrary(){
@@ -171,34 +41,30 @@ async function loadLibrary(){
   if(!items.length){body.innerHTML='<tr><td colspan="6" class="muted">还没有视频——切到「分析」页签提交一个</td></tr>';return}
   for(const v of items){
     const ready=v.status==="ready";
+    const remote=v.source_kind==="url",url=String(v.source_url||""),validUrl=/^https?:\/\//i.test(url);
+    const origin=remote?`${validUrl?`<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a>`:`<span>${esc(url||'原链接未记录')}</span>`} <button type="button" class="cache-link" data-act="cache" data-id="${v.video_id}" title="打开该视频的文件缓存目录">文件缓存</button>`:`<span class="local-source-path">${esc(v.local_path||'原地址未记录')}</span>`;
     const tr=document.createElement("tr");
-    tr.innerHTML=`<td><div class="video-title-cell"><span>${esc(v.title||v.display_name||v.video_id)}</span>
-      ${v.source_kind==="url"?`<button type="button" class="cache-link" data-act="cache" data-id="${v.video_id}" title="打开该视频本地缓存所在的文件夹">本地缓存</button>`:""}</div></td>
+    tr.innerHTML=`<td><div class="video-title-cell"><span>${esc(v.conversation_title||v.title||v.display_name||v.video_id)}</span></div><div class="video-source">${origin}</div></td>
       <td><span class="pill ${ready?"ready":v.status==="failed"?"failed":"other"}">${esc(v.status)}</span></td>
       <td>${hms(v.duration_ms)}</td><td data-detail-only>-</td><td data-detail-only>${esc(v.language||"-")}</td>
-      <td>${ready?`<a class="tlink" href="#" data-act="report" data-id="${v.video_id}">📋 报告</a>
-                   <a class="tlink" href="/chat?video_id=${v.video_id}">💬 对话</a>
+      <td>${ready?`<a class="tlink" href="#" data-act="report" data-id="${v.video_id}" data-conversation="${esc(v.conversation_id)}">报告</a>
+                   <a class="tlink" href="${v.conversation_id?`/ui?conversation=${encodeURIComponent(v.conversation_id)}`:`/chat?video_id=${v.video_id}`}">对话</a>
                    <a class="tlink" href="#" data-act="del" data-id="${v.video_id}">删除</a>`
                  :`<a class="tlink" href="#" data-act="del" data-id="${v.video_id}">删除</a>`}</td>`;
     body.appendChild(tr);
   }
   body.querySelectorAll('[data-act="report"]').forEach(a=>a.onclick=async e=>{
-    e.preventDefault(); const id=a.dataset.id;
-    try{
-      const r=await fetch(`/internal/videos/${id}/report`,{headers:H()});
-      if(!r.ok){toast((await r.json().catch(()=>({}))).detail||"报告读取失败");return}
-      showResult({status:"done",report:await r.json()});
-      // 切到「分析」页签并滚到结果卡
-      $$(".tabs button").forEach(x=>x.classList.toggle("on",x.dataset.t==="analyze"));
-      $$(".tabpane").forEach(p=>p.classList.toggle("on",p.id==="p-analyze"));
-      $("#resultCard").scrollIntoView({behavior:"smooth",block:"start"});
-    }catch(err){toast("报告读取失败："+err)}
+    e.preventDefault();
+    try{await VideoLensWorkspace.openVideo(a.dataset.id,a.dataset.conversation)}catch(err){toast(err.message)}
   });
   body.querySelectorAll('[data-act="del"]').forEach(a=>a.onclick=async e=>{
     e.preventDefault(); const id=a.dataset.id;
-    if(!confirm("删除视频 "+id+" 及其切片/关键帧/向量？"))return;
-    await fetch("/internal/videos/"+id,{method:"DELETE",headers:H()});
-    toast("已删除"); loadLibrary();
+    if(!confirm("删除视频 "+id+" 及其全部关联历史对话、报告、切片、向量和本地缓存？"))return;
+    try{
+      const response=await fetch("/internal/videos/"+id,{method:"DELETE",headers:{...H(),'X-VideoLens-Linked-Delete':'1'}}),result=await response.json();
+      if(!response.ok)throw new Error(result.detail||"删除失败");
+      await VideoLensWorkspace.deleted(result);toast("已删除视频及全部关联对话");
+    }catch(error){toast(error.message)}
   });
   body.querySelectorAll('[data-act="cache"]').forEach(button=>button.onclick=async()=>{
     button.disabled=true;
@@ -229,7 +95,7 @@ async function loadStatus(){
   const st=await (await fetch("/internal/settings",{headers:H()})).json();
   $("#backendBox").innerHTML=(st.backends||[]).map(b=>
     `<div class="backend"><span class="${b.enabled?"on":"off"}">${b.enabled?"●":"○"}</span>
-     <b>${esc(b.name)}</b> — ${esc(b.detail)}${b.warning?` <div class="warnline">⚠ ${esc(b.warning)}</div>`:""}</div>`).join("");
+     <b>${esc(b.name)}</b> — ${esc(b.detail)}${b.warning?` <div class="warnline">${esc(b.warning)}</div>`:""}</div>`).join("");
 }
 
 /* ---------- 设置 ---------- */
@@ -237,6 +103,7 @@ async function loadSettings(){
   const st=await (await fetch("/internal/settings",{headers:H()})).json();
   const v=st.values||{};
   VideoLensKeys.load(st);
+  window.VideoLensQuality?.load(st);
   $("#llm_mode").value="cloud";
   $("#llm_base").value=v["llm.cloud.base_url"]||"";
   $("#llm_model").value=v["llm.cloud.model"]||"";
@@ -266,11 +133,13 @@ $("#saveSet").onclick=async()=>{
   payload["vl.cloud_enabled"]=$("#vl_on").checked;
   put("vl.cloud_base_url",$("#vl_base")); put("vl.cloud_model",$("#vl_model"));
   VideoLensKeys.append(payload);
+  window.VideoLensQuality?.append(payload);
   payload["asr.device"]=$("#asr_device").value;
   payload["asr.compute_type"]=payload["asr.device"]==="cuda"?"float16":"int8";
   payload["embedding.text_device"]=$("#text_device").value;
   payload["embedding.image_device"]=$("#image_device").value;
   payload["ui.report_mode"]=$("#report_mode").value;
+  payload["ui.theme_mode"]=window.VideoLensTheme?.mode||"system";
   const r=await fetch("/internal/settings",{method:"POST",headers:HJ(),body:JSON.stringify(payload)});
   if(!r.ok)throw new Error((await r.json()).detail||r.status);
   const st=await r.json();
@@ -278,6 +147,7 @@ $("#saveSet").onclick=async()=>{
   try{localStorage.setItem("videolens.reportMode",reportMode)}catch(err){/* 禁用存储不影响本页 */}
   showDevices(st);
   VideoLensKeys.load(st);
+  window.VideoLensQuality?.load(st);
   $("#setBackends").innerHTML=(st.backends||[]).map(b=>
     `<div class="backend"><span class="${b.enabled?"on":"off"}">${b.enabled?"●":"○"}</span>
      <b>${esc(b.name)}</b> — ${esc(b.detail)}</div>`).join("");
@@ -308,9 +178,11 @@ async function initialize(){
   try{
     const st=await (await fetch("/internal/settings",{headers:H()})).json();
     applyReportMode(st.effective?.["ui.report_mode"]||"user");
+    window.VideoLensTheme?.apply(st.effective?.["ui.theme_mode"]||"system");
     showDevices(st);
   }catch(err){toast("报告偏好读取失败，使用用户模式")}
   loadLibrary();loadStatus();
+  await VideoLensWorkspace.init();
 }
 initialize();
 if(["#memory","#memoryNew"].includes(location.hash))document.querySelector('[data-t="memory"]').click();

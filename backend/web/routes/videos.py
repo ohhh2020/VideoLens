@@ -39,6 +39,7 @@ from backend.web.schemas import (
     DeleteOut,
 )
 from backend.web.dependencies import (
+    require_linked_delete_ui,
     _orchestrator,
     _video_out,
     _clip_out,
@@ -115,7 +116,8 @@ def create_router(cfg=None):
             )
         except StorageError as exc:
             raise HTTPException(status_code=500, detail=f"读取列表失败: {exc}") from exc
-        return [_video_out(item) for item in records]
+        conversations=orch.repository.library_conversations([item.video_id for item in records])
+        return [_video_out(item,conversations.get(item.video_id)) for item in records]
 
     @router.get(
         "/videos/{video_id}",
@@ -134,7 +136,7 @@ def create_router(cfg=None):
         clips = [_clip_out(c) for c in orch.repository.get_clips(video_id)]
         frames = [_keyframe_out(k) for k in orch.repository.get_keyframes(video_id)]
         return VideoDetailOut(
-            video=_video_out(record),
+            video=_video_out(record,orch.repository.library_conversations([video_id]).get(video_id)),
             clips=clips,
             keyframes=frames,
             clip_count=len(clips),
@@ -293,20 +295,24 @@ def create_router(cfg=None):
         "/videos/{video_id}",
         response_model=DeleteOut,
         tags=["videos"],
-        summary="删除视频及其切片、关键帧、向量",
+        summary="删除视频、全部关联会话及其缓存与索引",
     )
     def delete_video(request: Request, video_id: str) -> DeleteOut:
+        require_linked_delete_ui(request)
         orch = _orchestrator(request)
         try:
             removed = orch.delete(video_id)
         except PipelineError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if removed.get("db_error") and "不存在" in str(removed["db_error"]):
             raise HTTPException(status_code=404, detail=f"视频不存在: {video_id}")
+        if removed.get('db_error') or removed.get('vectors_error'):
+            raise HTTPException(500, detail='联动删除未全部完成：' + str(removed.get('db_error') or removed.get('vectors_error')))
         return DeleteOut(
             video_id=video_id,
             db=list(removed.get("db") or []),
             vectors=dict(removed.get("vectors") or {}),
+            conversation_ids=list(removed.get('conversation_ids') or []),
         )
 
     @router.post(

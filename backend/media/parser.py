@@ -363,6 +363,9 @@ def _resolve_local(raw: str | Path, *, base_dir: Path | None) -> Path:
         resolved = expanded.resolve(strict=False)
     except OSError:  # 某些 UNC 路径在无网络时 resolve 会抛
         resolved = expanded.absolute()
+    # 文件链接保留为媒体访问路径，身份仍由下方的原始目标生成。
+    if expanded.is_symlink():
+        return Path(os.path.abspath(expanded))
     return resolved
 
 
@@ -413,7 +416,7 @@ def parse_local(
         )
 
     try:
-        video_id = derive_video_id(f"file:{path}:{size}")
+        video_id = derive_video_id(f"file:{path.resolve()}:{size}")
     except OSError:  # pragma: no cover - 指纹失败不该阻断主流程
         video_id = derive_video_id(f"file:{path}")
 

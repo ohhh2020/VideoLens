@@ -535,7 +535,7 @@ def main() -> int:
     check(
         "超长问题 422",
         client.post(
-            f"/internal/videos/{video_id}/ask", json={"question": "问" * 501}
+            f"/internal/videos/{video_id}/ask", json={"question": "问" * 2001}
         ).status_code
         == 422,
     )
@@ -581,7 +581,7 @@ def main() -> int:
     check(
         "独立前端脚本可加载", client.get("/assets/workbench/app.js").status_code == 200
     )
-    check("独立前端样式可加载", client.get("/assets/chat/style.css").status_code == 200)
+    check("统一前端样式可加载", client.get("/assets/workbench/style.css").status_code == 200)
 
     check(
         "旧内部 MCP 路径也已删除",

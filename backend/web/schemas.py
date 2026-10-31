@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 
-from typing import Literal
+from typing import Any, Literal
 
 
 from pydantic import BaseModel, Field, field_validator
@@ -47,7 +47,7 @@ class AskRequest(BaseModel):
     model_config = {"extra": "forbid"}
 
     question: str = Field(
-        ..., min_length=1, max_length=500, description="问题（≤500 字符）"
+        ..., min_length=1, max_length=2000, description="问题（≤2000 字符）"
     )
     top_k: int | None = Field(None, ge=1, le=50, description="检索条数，默认取配置")
     max_context_tokens: int | None = Field(None, ge=512, le=32_000)
@@ -76,6 +76,8 @@ class CitationOut(BaseModel):
 
 
 class AnswerOut(BaseModel):
+    usage: dict[str, Any] = Field(default_factory=dict)
+    truncated: bool = False
     question: str
     answer: str
     video_id: str
@@ -123,6 +125,9 @@ class VideoOut(BaseModel):
     video_id: str
     display_name: str = ""
     title: str = ""
+    conversation_id: str = ""
+    conversation_title: str = ""
+    local_path: str = ""
     source_kind: str = ""
     source_url: str = ""
     duration_ms: int = 0
@@ -213,10 +218,12 @@ class StatsOut(BaseModel):
     keyframe_bytes: int = 0
     db_bytes: int = 0
     usage: dict[str, float] = Field(default_factory=dict)
+    cache: dict[str, int] = Field(default_factory=dict)
 
 
 class DeleteOut(BaseModel):
     video_id: str
+    conversation_ids: list[str] = Field(default_factory=list)
     db: list[str] = Field(default_factory=list)
     vectors: dict[str, int] = Field(default_factory=dict)
     deleted: bool = True

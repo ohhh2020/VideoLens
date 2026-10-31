@@ -35,6 +35,13 @@ ROOT = TESTS_DIR.parent
 
 #: (文件名, 分类, 说明) —— 顺序即执行顺序，从底层依赖向上。
 SUITES: tuple[tuple[str, str, str], ...] = (
+    ("test_local_links.py", "本地视频", "真实软链接、原文件保护、本机选择器与视频库会话标题"),
+    ("test_fast_analysis.py", "性能回退", "固定采样、整帧识别、单次报告与旧版快照兼容"),
+    ("test_terminal.py", "终端", "Windows VT、MSYS PTY、普通管道与无ANSI输出"),
+    ("test_integrity_qa.py", "完整性", "动态检索、全片章节遍历与旧视频禁止补帧"),
+    ("test_integrity_media.py", "完整性", "真实FFmpeg分辨率与时间验证、GPU批次OOM缩小"),
+    ("test_integrity.py", "完整性", "证据、分窗、全量摘要树、事务发布和断点续传"),
+    ("test_conversations.py", "工作台", "持久化会话、上传、意图边界、幂等与自动问答"),
     ("test_cloud_setup.py", "配置", "空白云端配置、首次网页设置与生成阻断"),
     ("test_warning_fixes.py", "兼容", "SigLIP配置序列化与下载路径/匿名字幕警告"),
     ("test_session_logs.py", "日志", "按启动创建日志、每日递增与并发防覆盖"),

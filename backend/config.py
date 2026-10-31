@@ -30,6 +30,8 @@
 
 from __future__ import annotations
 
+from backend.analysis.policy import IntegritySection
+
 import dataclasses
 import json
 import logging
@@ -194,8 +196,8 @@ class DownloadSection:
     max_url_length: int = 2048
     #: 下载源的最高分辨率。分析链路对清晰度的真实需求：关键帧目标短边 720
     #: （只缩不放）、视觉模型输入 448px、场景检测还会再降采样 —— 1080p 源
-    #: 只是让下载多花两三倍时间。720p 同时也是 B 站免登录可得的最高档。
-    format_max_height: int = 720
+    #: 默认1080p；受平台与账号权限限制时记录实际获取结果。
+    format_max_height: int = 1080
 
     def validate(self) -> None:
         if self.max_retries < 0:
@@ -775,7 +777,7 @@ class StorageSection:
 class ApiSection:
     host: str = "127.0.0.1"
     port: int = 8000
-    max_body_bytes: int = 4_294_967_296
+    max_body_bytes: int = 8_589_934_592
     sse_heartbeat_s: int = 15
     request_timeout_s: int = 300
     #: 原生网页入口为 /ui；关闭后根路径显示服务导航。
@@ -791,8 +793,8 @@ class ApiSection:
 class LimitsSection:
     max_url_length: int = 2048
     max_duration_ms: int = 7_200_000
-    max_file_bytes: int = 4_294_967_296
-    max_question_chars: int = 500
+    max_file_bytes: int = 8_589_934_592
+    max_question_chars: int = 2000
     max_report_chars: int = 5_000
     min_keyframe_short_side: int = 720
     timestamp_tolerance_ms: int = 1_000
@@ -803,6 +805,10 @@ class LimitsSection:
     pipeline_parallel: bool = True
 
     def validate(self) -> None:
+        if self.max_file_bytes > 8 * 1024**3 or self.max_duration_ms > 7_200_000:
+            raise ValueError("接收上限不能超过2小时 / 8 GiB")
+        if self.max_question_chars > 2000:
+            raise ValueError("有效问题上限为2000字符")
         for name in (
             "max_url_length",
             "max_duration_ms",
@@ -913,10 +919,13 @@ class UiSection:
     """网页报告偏好，不影响分析产物与模型。"""
 
     report_mode: str = "user"
+    theme_mode: str = "system"
 
     def validate(self) -> None:
         if self.report_mode not in {"user", "detailed"}:
             raise ConfigValueError("ui.report_mode", "user|detailed", self.report_mode)
+        if self.theme_mode not in {"system", "light", "dark"}:
+            raise ConfigValueError("ui.theme_mode", "system|light|dark", self.theme_mode)
 
 
 @dataclass(frozen=True, slots=True)
@@ -964,6 +973,7 @@ class AppConfig:
     targets: TargetsSection = field(default_factory=TargetsSection)
     logging: LoggingSection = field(default_factory=LoggingSection)
     ui: UiSection = field(default_factory=UiSection)
+    integrity: IntegritySection = field(default_factory=IntegritySection)
     memory: MemorySection = field(default_factory=MemorySection)
     # 运行时注入，不来自 YAML
     root_dir: Path = field(
@@ -1021,6 +1031,7 @@ class AppConfig:
             raise ConfigValueError("vl.cloud_enabled", "必须为 true", False)
         self.models.validate()
         self.ui.validate()
+        self.integrity.validate()
         self.memory.validate()
         self.media.validate()
         self.asr.validate()

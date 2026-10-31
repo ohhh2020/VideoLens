@@ -40,7 +40,9 @@ def apply_local_devices(orch, config, persist):
         changed.append("bge-m3")
     if current["siglip2-base"] != detect_device(config.embedding.image_device or config.models.device):
         changed.append("siglip2-base")
-    runtime_config = replace(previous, asr=config.asr, embedding=config.embedding, ui=config.ui)
+    runtime_config = replace(previous, asr=config.asr, embedding=config.embedding, ui=config.ui,
+        integrity=config.integrity, media=config.media, limits=config.limits, report=config.report,
+        chunk=config.chunk, retrieval=config.retrieval, vl=replace(previous.vl, max_image_side=config.vl.max_image_side))
     if not changed:
         persist()
         orch._cfg = runtime_config

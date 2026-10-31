@@ -37,6 +37,13 @@ def create_app(cfg: AppConfig | None = None, *, orchestrator=None) -> FastAPI:
         orch = orchestrator or await asyncio.to_thread(Orchestrator.from_config, config)
         application.state.orchestrator = orch
         set_orchestrator(orch)
+        from backend.web.routes.conversations import assistant
+        if getattr(orch, '_use_integrity', False):
+            with orch.repository._tx() as conn:
+                conn.execute("UPDATE analysis_runs SET status='interrupted',error='服务重启，请手动重试' WHERE status='running'")
+        # 先恢复会话状态；重启只标记中断，不静默重新提交云端任务。
+        from types import SimpleNamespace
+        assistant(SimpleNamespace(app=application))
         if getattr(orch,"_memory",None) is not None and not getattr(orch, "_cloud_setup_required", ()):
             orch._memory.notify()
         state = runtime_path("state/server.json", config.root_dir)
@@ -55,6 +62,8 @@ def create_app(cfg: AppConfig | None = None, *, orchestrator=None) -> FastAPI:
         try:
             yield
         finally:
+            if getattr(application.state, 'assistant', None) is not None:
+                await asyncio.to_thread(application.state.assistant.close)
             await asyncio.to_thread(shutdown_jobs, wait=True)
             await asyncio.gather(
                 *getattr(application.state, "qa_workers", ()), return_exceptions=True

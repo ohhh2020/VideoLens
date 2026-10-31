@@ -42,8 +42,6 @@ class RetrievalStages:
         # 14 段同质证据进总结就是 8 遍复读 + 逼模型在结尾幻觉差异。
         # 首次出现的描述保留全文，相似（bigram-Dice ≥ 0.75）的后续片段折叠成
         # "画面与前段类似"，时间跨度保留 —— 覆盖率不丢，重复信息只算一次。
-        from backend.pipeline.claims import dice  # noqa: PLC0415
-
         seen_descs: list[str] = []
         for item in items:
             notes: list[str] = []
@@ -71,7 +69,7 @@ class RetrievalStages:
             joined = " ".join(
                 d for d, _ in sorted(grouped.items(), key=lambda kv: min(kv[1]))
             )
-            similar = next((s for s in seen_descs if dice(s, joined) >= 0.75), None)
+            similar = next((s for s in seen_descs if s == joined), None)
             if similar is None:
                 seen_descs.append(joined)
                 for desc, stamps in sorted(grouped.items(), key=lambda kv: min(kv[1])):
@@ -81,7 +79,7 @@ class RetrievalStages:
                         if hi - lo > 500
                         else _ms_label(lo)
                     )
-                    notes.append(f"【画面 {span}】{desc[:240]}")
+                    notes.append(f"【画面 {span}】{desc}")
             else:
                 stamps_all = [ms for sts in grouped.values() for ms in sts]
                 lo, hi = min(stamps_all), max(stamps_all)
@@ -159,6 +157,16 @@ class RetrievalStages:
                     )
 
         payloads = list(self._repo.iter_clip_payloads(video_id))
+        if getattr(self, '_use_integrity', False):
+            from backend.analysis.qa import active_ledger
+            ledger = active_ledger(self, video_id)
+            if ledger:
+                from collections import defaultdict
+                bodies = defaultdict(list)
+                for evidence in ledger.all_evidence():
+                    bodies[evidence['clip_id']].append(evidence['text'])
+                payloads = [{**p, 'text': '\n'.join(bodies.get(p['clip_id'], [])) or p.get('text', ''),
+                             'core_text': '\n'.join(bodies.get(p['clip_id'], [])) or p.get('core_text', '')} for p in payloads]
         clip_index = {str(p["clip_id"]): p for p in payloads}
         bm25 = self._cached_bm25(video_id, payloads)
         if bm25 is not None:
@@ -194,7 +202,7 @@ class RetrievalStages:
             return None
         from backend.rag.hybrid_search import BM25Channel  # noqa: PLC0415
 
-        stamp = (video_id, len(payloads), str(payloads[-1].get("clip_id") or ""))
+        stamp = (video_id, len(payloads), hash(tuple((p.get("clip_id"), p.get("text")) for p in payloads)))
         with self._bm25_lock:
             hit = self._bm25_cache.get(video_id)
             if hit is not None and hit[0] == stamp:

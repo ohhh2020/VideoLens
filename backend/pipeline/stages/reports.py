@@ -410,6 +410,15 @@ class ReportStages:
     ) -> tuple[str, str]:
         if opts.skip_summary:
             return "", "skipped"
+        if getattr(self, "_analysis_run", None) is not None:
+            from backend.analysis.fast import enabled
+            if enabled(self):
+                from backend.analysis.fast import summarize
+            else:
+                from backend.analysis.summary import summarize
+            text = summarize(self._repo, video_id, title, self._llm, self._cfg.integrity, self._analysis_run,
+                preference=lambda messages: self._preference_messages(messages, title, report=True))
+            return text, "cloud"
         payloads = list(self._repo.iter_clip_payloads(video_id))
         payloads = self._attach_visuals(video_id, payloads)
         from backend.pipeline.context_builder import ContextBuilder  # noqa: PLC0415

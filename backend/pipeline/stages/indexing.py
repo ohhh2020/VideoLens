@@ -22,6 +22,8 @@ class IndexingStages:
     def _encode_index_inputs(self, clips, keyframes, report, opts):
         if opts.skip_vectors:
             return None
+        if getattr(self, "_analysis_run", None) is not None:
+            return None
         if self._embedder is None:
             raise PipelineError("缺少必需编码器，禁止降级")
 
@@ -82,6 +84,9 @@ class IndexingStages:
         if self._vectors is None or self._embedder is None:
             raise PipelineError("缺少必需向量库或编码器，禁止降级")
 
+        if getattr(self, "_analysis_run", None) is not None:
+            from backend.analysis.indexing import build_index
+            return build_index(self, video_id, clips, keyframes, report)
         encoded = encoded or self._encode_index_inputs(clips, keyframes, report, opts)
         if encoded.get("error") is not None:
             raise PipelineError(f"必需向量编码失败：{encoded['error']}") from encoded[
@@ -188,6 +193,8 @@ class IndexingStages:
             except Exception:  # noqa: BLE001
                 logger.debug("清理未提交的索引代失败: %s", generation, exc_info=True)
             raise PipelineError(f"索引指针切换失败：{exc}") from exc
+        if getattr(self, "_analysis_run", None) is not None:
+            return
         if previous and previous != generation:
             try:
                 self._vectors.drop_generation(previous)

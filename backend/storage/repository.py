@@ -47,6 +47,8 @@ from pathlib import Path
 from typing import Any, Final, Literal
 
 from backend.config import AppConfig, get_app_config
+from backend.storage.conversations import DDL_V6, DDL_V7
+from backend.analysis.runs import DDL_V8
 
 logger = logging.getLogger("zhiying.storage.repository")
 
@@ -128,7 +130,7 @@ VideoStatus = Literal[
 
 TaskStatus = Literal["pending", "running", "done", "failed", "cancelled"]
 
-SCHEMA_VERSION: Final[int] = 5
+SCHEMA_VERSION: Final[int] = 8
 
 #: 表名 → ``storage.limits`` 里对应的上限字段
 _LIMIT_MAP: Final[dict[str, str]] = {
@@ -614,6 +616,9 @@ _MIGRATIONS: Final[dict[int, tuple[str, ...]]] = {
     3: _DDL_V3,
     4: _DDL_V4,
     5: _DDL_V5,
+    6: DDL_V6,
+    7: DDL_V7,
+    8: DDL_V8,
 }
 
 # =============================================================================
@@ -784,6 +789,14 @@ class SqliteRepository:
             )
         if current == SCHEMA_VERSION:
             return
+        if 0 < current < 8:
+            backup = self._path.with_name(self._path.name + ".before-v8.bak")
+            if not backup.exists():
+                destination = sqlite3.connect(backup)
+                try:
+                    conn.backup(destination)
+                finally:
+                    destination.close()
         logger.info(
             "初始化数据库 schema: %s → %s (%s)", current, SCHEMA_VERSION, self._path
         )
@@ -1129,7 +1142,30 @@ class SqliteRepository:
         )
         return paths
 
-    def delete_video(self, video_id: str) -> list[str]:
+    def ensure_video_idle(self, video_id: str, conn=None) -> None:
+        """任一关联会话在处理，或该视频正在分析时，拒绝联动删除。"""
+        conn = conn or self.connection()
+        if conn.execute("SELECT 1 FROM analysis_runs WHERE video_id=? AND status='running'", (video_id,)).fetchone():
+            raise RepositoryError('该视频正在分析，请等待当前任务完成后删除')
+        if conn.execute("SELECT 1 FROM tasks WHERE video_id=? AND status IN ('queued','running')", (video_id,)).fetchone():
+            raise RepositoryError('该视频有运行中的任务，请等待任务完成后删除')
+        if conn.execute("SELECT 1 FROM conversation_operations o JOIN conversations c ON c.id=o.conversation_id "
+                        "WHERE c.video_id=? AND o.status IN ('queued','running')", (video_id,)).fetchone():
+            raise RepositoryError('该视频的关联会话正在处理，请等待分析或问答完成后删除')
+
+    def library_conversations(self, video_ids):
+        """批量取最近活动的已命名会话，避免视频列表逐条查询。"""
+        ids=list(dict.fromkeys(video_ids))
+        if not ids:
+            return {}
+        rows=self._query('SELECT id,video_id,title,title_source FROM conversations WHERE video_id IN ('
+            + ','.join('?' for _ in ids)+") ORDER BY (title_source='pending'),updated_ts DESC,id DESC",ids)
+        result={}
+        for row in rows:
+            result.setdefault(row['video_id'],dict(row))
+        return result
+
+    def delete_video(self, video_id: str, *, missing_ok=False) -> list[str]:
         """删除视频及其级联记录，返回**需要调用方清理的**关键帧文件路径。
         数据库层不动文件系统 —— 删除是破坏性操作，交给上层决定
         （例如 ``--keep-frames`` 场景下只删库不删图）。
@@ -1138,10 +1174,20 @@ class SqliteRepository:
             "SELECT path FROM keyframes WHERE video_id=?", (video_id,)
         )
         paths = [str(r["path"]) for r in kf_rows if r["path"]]
-        with self._tx() as conn:
-            cur = conn.execute("DELETE FROM videos WHERE video_id=?", (video_id,))
-            if cur.rowcount == 0:
-                raise NotFoundError("video", video_id)
+        from backend.storage.lifecycle import video_guard
+        with video_guard(video_id), self._tx() as conn:
+            self.ensure_video_idle(video_id, conn)
+            exists = conn.execute('SELECT 1 FROM videos WHERE video_id=?', (video_id,)).fetchone()
+            if not exists and not missing_ok:
+                raise NotFoundError('video', video_id)
+            sessions = conn.execute('SELECT session_id FROM conversations WHERE video_id=?', (video_id,)).fetchall()
+            for sid in ['', *(row['session_id'] for row in sessions)]:
+                conn.execute('INSERT OR IGNORE INTO conversation_imports VALUES (?)', (f'legacy:{video_id}:{sid}',))
+            # 会话没有视频外键：必须与视频删除放在同一事务，子表由FK级联。
+            conn.execute('DELETE FROM conversations WHERE video_id=?', (video_id,))
+            # 旧版问答表没有视频外键，不能依赖ON DELETE CASCADE。
+            conn.execute('DELETE FROM qa_history WHERE video_id=?', (video_id,))
+            conn.execute('DELETE FROM videos WHERE video_id=?', (video_id,))
         logger.info("删除视频 %s，含 %d 个关键帧记录", video_id, len(paths))
         return paths
 
@@ -1726,6 +1772,7 @@ class SqliteRepository:
                     "elapsed_ms": int(row["elapsed_ms"]),
                     "session_id": row["session_id"],
                     "created_at": row["created_at"],
+                    "created_ts": row["created_ts"],
                 }
             )
         return list(reversed(out)) if newest else out

@@ -39,6 +39,10 @@ def create_router(cfg=None):
         orch = getattr(request.app.state, "orchestrator", None) or _ORCH
         devices = active_devices(orch)
         loaded = set(devices.values())
+        assistant = getattr(request.app.state, 'assistant', None)
+        assistant_running = assistant.store.repo._query_one(
+            "SELECT COUNT(*) AS count FROM conversation_operations WHERE status IN ('queued','running')"
+        )['count'] if assistant else 0
         return HealthOut(
             pid=os.getpid(),
             status="ok" if orch is not None else "degraded",
@@ -48,7 +52,7 @@ def create_router(cfg=None):
             device=next(iter(loaded)) if len(loaded) == 1 else "mixed",
             model_devices=devices,
             auth="local-web",
-            jobs_running=get_job_store().running_count(),
+            jobs_running=get_job_store().running_count() + assistant_running,
             jobs_total=get_job_store().total(),
         )
 
@@ -80,7 +84,9 @@ def create_router(cfg=None):
             payload = _as_dict(raw)
         except StorageError as exc:
             raise HTTPException(status_code=500, detail=f"读取统计失败: {exc}") from exc
+        from backend.analysis.resources import inventory
         return StatsOut(
+            cache=inventory(orch._cfg) if hasattr(orch, '_cfg') else {},
             videos=int(payload.get("videos", 0)),
             clips=int(payload.get("clips", 0)),
             transcript_segments=int(payload.get("transcript_segments", 0)),

@@ -176,6 +176,7 @@ def build_orchestrator(
             memory=memory,
         )
         orch._cloud_setup_required = tuple(pending)
+        orch._use_integrity = True
         return orch
     except Exception:
         embed.unload()

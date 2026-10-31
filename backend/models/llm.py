@@ -107,7 +107,6 @@ class LlmResponse:
             "text": self.text,
             "backend": self.backend,
             "model": self.model,
-            "enable_thinking": False,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
@@ -207,14 +206,17 @@ class OpenAICompatibleBackend:
         temperature: float,
         stop: Sequence[str],
         stream: bool,
+        json_mode: bool = False,
     ) -> bytes:
         body: dict[str, Any] = {
             "model": self.model,
+            **({"response_format": {"type": "json_object"}} if json_mode else {}),
             "enable_thinking": False,
             "messages": [m.to_dict() for m in messages],
             "max_tokens": int(max_tokens),
             "temperature": float(temperature),
             "stream": bool(stream),
+            **({"stream_options": {"include_usage": True}} if stream else {}),
         }
         if stop:
             body["stop"] = list(stop)
@@ -228,6 +230,7 @@ class OpenAICompatibleBackend:
         temperature: float | None = None,
         stop: Sequence[str] = (),
         timeout: float | None = None,
+        json_mode: bool = False,
     ) -> LlmResponse:
         if not self.available():
             raise LlmError("云端后端未配置 base_url 或 model")
@@ -238,6 +241,7 @@ class OpenAICompatibleBackend:
             temperature if temperature is not None else 0.3,
             stop,
             stream=False,
+            json_mode=json_mode,
         )
         request = urllib.request.Request(
             self.endpoint, data=payload, headers=self._headers(), method="POST"
@@ -246,7 +250,9 @@ class OpenAICompatibleBackend:
 
         deadline = started + timeout_s if timeout is not None else None
         last_error = ""
-        for attempt in range(self.max_retries + 1):
+        from backend.analysis.cloud import MANAGED, http_error
+        retries = 0 if MANAGED.get() else self.max_retries
+        for attempt in range(retries + 1):
             remaining = (
                 deadline - time.monotonic() if deadline is not None else timeout_s
             )
@@ -262,6 +268,8 @@ class OpenAICompatibleBackend:
             except urllib.error.HTTPError as exc:
                 detail = _read_error_body(exc)
                 last_error = f"HTTP {exc.code}: {detail}"
+                if MANAGED.get() and exc.code not in {401, 403}:
+                    raise http_error(LlmError(last_error), exc) from exc
                 # 4xx（除 429）重试无意义
                 if exc.code in {401, 403}:
                     self._auth_error = f"云端认证失败 HTTP {exc.code}，请核对完整 API Key、服务地址和权限，保存后重启服务"
@@ -276,7 +284,7 @@ class OpenAICompatibleBackend:
                 last_error = f"响应不是合法 JSON: {exc}"
             except Exception as exc:  # noqa: BLE001
                 last_error = f"{type(exc).__name__}: {exc}"
-            if attempt < self.max_retries:
+            if attempt < retries:
                 delay = min(4.0, 0.8 * (2**attempt))
                 logger.warning(
                     "云端 LLM 第 %d 次失败(%s)，%.1fs 后重试",
@@ -310,7 +318,7 @@ class OpenAICompatibleBackend:
             finish_reason=str(choices[0].get("finish_reason") or ""),
         )
 
-    def stream(
+    def stream_events(
         self,
         messages: Sequence[LlmMessage],
         *,
@@ -334,6 +342,7 @@ class OpenAICompatibleBackend:
         )
         timeout_s = float(timeout if timeout is not None else self.timeout_s)
         finished = False
+        metadata = {"finish_reason": "", "prompt_tokens": 0, "completion_tokens": 0}
         try:
             with urllib.request.urlopen(request, timeout=timeout_s) as response:
                 for raw_line in response:
@@ -348,24 +357,32 @@ class OpenAICompatibleBackend:
                         obj = json.loads(chunk)
                     except json.JSONDecodeError:
                         continue
+                    if obj.get("usage"):
+                        metadata.update({key: int(obj["usage"].get(key) or 0) for key in ("prompt_tokens", "completion_tokens")})
                     for choice in obj.get("choices") or []:
                         if choice.get("finish_reason"):
+                            metadata["finish_reason"] = str(choice["finish_reason"])
                             finished = True
                         delta = choice.get("delta") or {}
                         piece = delta.get("content")
                         if piece:
-                            yield str(piece)
+                            yield ("delta", str(piece))
                 if not finished:
                     raise LlmError("云端流提前结束，未收到完成标志")
+                yield ("metadata", metadata)
         except urllib.error.HTTPError as exc:
             if exc.code in {401, 403}:
                 self._auth_error = f"云端认证失败 HTTP {exc.code}，请核对完整 API Key、服务地址和权限，保存后重启服务"
                 raise LlmAuthenticationError(self._auth_error) from exc
-            raise LlmError(
-                f"云端流式请求失败 HTTP {exc.code}: {_read_error_body(exc)}"
-            ) from exc
+            from backend.analysis.cloud import http_error
+            raise http_error(LlmError(f"云端流式请求失败 HTTP {exc.code}: {_read_error_body(exc)}"), exc) from exc
         except urllib.error.URLError as exc:
             raise LlmError(f"云端流式请求网络错误: {exc.reason}") from exc
+
+    def stream(self, messages, **kwargs):
+        for kind, value in self.stream_events(messages, **kwargs):
+            if kind == 'delta':
+                yield value
 
 
 def _read_error_body(exc: urllib.error.HTTPError) -> str:
@@ -448,13 +465,15 @@ class LlmGateway:
             timeout_s=cfg.timeout_s,
             max_retries=cfg.max_retries,
         )
-        return cls(
+        gateway = cls(
             [backend],
             max_tokens=cfg.max_tokens,
             temperature=cfg.temperature,
             timeout_s=cfg.timeout_s,
             max_concurrency=cfg.max_concurrency,
         )
+        gateway.policy = (config or get_app_config()).integrity
+        return gateway
 
     # -- 属性 --
 
@@ -476,7 +495,17 @@ class LlmGateway:
 
     # -- 调用 --
 
-    def complete(
+    def complete(self, messages, **kwargs):
+        from backend.analysis.cloud import MANAGED, request
+        from backend.analysis.policy import IntegritySection
+        interactive = kwargs.pop("interactive", False)
+        if MANAGED.get():
+            return self._complete(messages, **kwargs)
+        result = request(None, getattr(self, 'policy', IntegritySection()), '文本生成', {},
+                         lambda: self._complete(messages, **kwargs), interactive=interactive)
+        return LlmResponse(**{name: getattr(result, name) for name in LlmResponse.__dataclass_fields__ if hasattr(result, name)})
+
+    def _complete(
         self,
         messages,
         *,
@@ -485,6 +514,7 @@ class LlmGateway:
         stop=(),
         timeout=None,
         require_quality=False,
+        json_mode=False,
     ):
         """直接调用唯一的云端模型，失败即抛出，不使用替代内容。"""
         backend = self._backends[0]
@@ -496,6 +526,7 @@ class LlmGateway:
                 max_tokens=self.max_tokens if max_tokens is None else max_tokens,
                 temperature=self.temperature if temperature is None else temperature,
                 stop=stop,
+                **({"json_mode": True} if json_mode else {}),
                 timeout=self.timeout_s if timeout is None else timeout,
             )
         if not result.text.strip():
@@ -503,26 +534,31 @@ class LlmGateway:
         result.backend, result.degraded, result.attempts = "cloud", False, ["cloud:ok"]
         return result
 
-    def stream(
-        self, messages, *, max_tokens=None, temperature=None, stop=(), timeout=None
-    ):
-        """逐段转发云端输出；中途失败直接上报，避免重复请求产生重复文字。"""
+    def stream_events(self, messages, *, max_tokens=None, temperature=None, stop=(), timeout=None):
+        from backend.analysis.cloud import SCHEDULER, MANAGED
+        from backend.analysis.policy import IntegritySection
         backend = self._backends[0]
         if not backend.available():
-            raise LlmError("云端文本模型配置不可用")
-        produced = False
-        with self._slots:
-            for piece in backend.stream(
-                normalize_messages(messages),
-                max_tokens=self.max_tokens if max_tokens is None else max_tokens,
-                temperature=self.temperature if temperature is None else temperature,
-                stop=stop,
-                timeout=self.timeout_s if timeout is None else timeout,
-            ):
-                produced = True
-                yield piece
-        if not produced:
-            raise LlmError("云端文本模型返回空流")
+            raise LlmError('云端文本模型配置不可用')
+        with SCHEDULER.slot(getattr(self, 'policy', IntegritySection()), interactive=True), self._slots:
+            token = MANAGED.set(True)
+            try:
+                kwargs = dict(max_tokens=self.max_tokens if max_tokens is None else max_tokens,
+                    temperature=self.temperature if temperature is None else temperature, stop=stop,
+                    timeout=self.timeout_s if timeout is None else timeout)
+                if callable(getattr(backend, 'stream_events', None)):
+                    yield from backend.stream_events(normalize_messages(messages), **kwargs)
+                else:
+                    for piece in backend.stream(normalize_messages(messages), **kwargs):
+                        yield 'delta', piece
+                    yield 'metadata', {'finish_reason': '', 'prompt_tokens': 0, 'completion_tokens': 0}
+            finally:
+                MANAGED.reset(token)
+
+    def stream(self, messages, **kwargs):
+        for kind, value in self.stream_events(messages, **kwargs):
+            if kind == 'delta':
+                yield value
 
     # -- 业务便捷方法 --
 

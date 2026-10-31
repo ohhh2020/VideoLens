@@ -726,7 +726,8 @@ class ContextBuilder:
 
     def _make_item(self, raw: Any, *, index: int, source_rank: int) -> ContextItem:
         clip_id = str(_get(raw, "clip_id", "") or "")
-        text = str(_get(raw, "core_text", None) or _get(raw, "text", "") or "").strip()
+        from backend.analysis.evidence import compose
+        text = compose(raw).strip() if isinstance(raw, dict) else str(_get(raw, "text", "") or "").strip()
         keyframe_ids = _as_str_tuple(_get(raw, "keyframe_ids", ()))
         keyframe_paths = _as_str_tuple(_get(raw, "keyframe_paths", ()))
         ranks = _get(raw, "channel_ranks", {}) or {}

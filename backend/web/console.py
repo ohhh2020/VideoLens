@@ -9,7 +9,9 @@ import json
 import logging
 import os
 import queue
+import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -20,20 +22,61 @@ from multiprocessing.connection import Client, Listener
 from urllib.request import urlopen
 
 from backend.logging_setup import ANSI_ESCAPE, MANAGED_LOG_ENV, open_session_log
+from backend.terminal import CONSOLE_COLOR_ENV, supports_ansi, interactive_input, use_color
 
 logger = logging.getLogger("zhiying.console")
 CONTROL_ENV = "VIDEOLENS_CONSOLE_PIPE"
 COMMANDS = {"help", "status", "stop", "restart", "clear"}
 
 
-class ConsoleOutput:
-    """终端提示符/清屏与日志落盘分离，父子进程统一由此输出。"""
+def terminal_size():
+    """优先读取 Git Bash 的真实 PTY 尺寸，原生终端使用标准控制台查询。"""
+    # Windows Terminal 的 Git Bash 常直接继承 ConPTY 控制台句柄，
+    # 此时不应反复启动 MSYS stty（可能与控制台输入争用）。
+    try:
+        return os.get_terminal_size(sys.stderr.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+    stty = os.environ.get("VIDEOLENS_TERMINAL_STTY")
+    if stty:
+        try:
+            result = subprocess.run(
+                [stty, "-F", os.environ.get("VIDEOLENS_TERMINAL_TTY", "/dev/tty"), "size"], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, timeout=0.5,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            rows, columns = map(int, result.stdout.split())
+            if result.returncode == 0 and rows >= 3 and columns >= 4:
+                return os.terminal_size((columns, rows))
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            pass
+    return shutil.get_terminal_size(fallback=(80, 24))
 
-    def __init__(self, stream, *, interactive=False, color=False):
-        self.stream, self.interactive, self.color = stream, interactive, color
+
+class ConsoleOutput:
+    """上方日志滚动、底部固定输入行；终端控制码和提示符不写入文件。"""
+
+    def __init__(self, stream, *, interactive=False, color=False, ansi=None, size_provider=terminal_size):
+        self.ansi = bool(interactive or color) if ansi is None else bool(ansi)
+        self.stream, self.interactive, self.color = stream, bool(interactive and self.ansi), bool(color and self.ansi)
         self.lock = threading.RLock()
         self.file = None
         self.input_open = self.prompt_visible = False
+        self.size_provider = size_provider
+        self.rows = None
+        self.last_size_check = 0.0
+        self.pending = ""
+        self.input_text = ""
+        self.native_output = os.name == 'nt' and stream in (sys.stdout, sys.stderr)
+
+    def _terminal_write(self, text):
+        # 原生库/子进程可能重新设置共享控制台模式。每次渲染前核验，
+        # 防止已禁用VT后把光标控制码当文字输出。
+        if self.native_output and self.ansi and not supports_ansi(self.stream):
+            self.ansi = self.color = self.interactive = False
+            self.rows = None
+        self.stream.write(text if self.ansi else ANSI_ESCAPE.sub('', text))
 
     def start_session(self, directory):
         with self.lock:
@@ -41,33 +84,86 @@ class ConsoleOutput:
                 self.file.close()
             self.file = open_session_log(directory)
 
+    def _layout(self):
+        size = self.size_provider()
+        rows = max(3, size.lines)
+        if rows == self.rows:
+            return
+        # 只保留最后一行输入；DEC 滚动区域不包含这一行。
+        if self.rows is not None:
+            self._terminal_write(f"\033[{min(self.rows, rows)};1H\033[2K")
+        self.rows = rows
+        self._terminal_write(f"\033[1;{rows - 1}r")
+        self.prompt_visible = False
+
     def _prompt(self):
         if self.interactive and self.input_open and not self.prompt_visible:
-            self.stream.write("\033[33m<< \033[0m" if self.color else "<< ")
+            self._terminal_write(f"\033[{self.rows};1H\033[2K")
+            self._terminal_write(("\033[33m<< \033[0m" if self.color else "<< ") + self.input_text)
             self.prompt_visible = True
+
+    def edit_input(self, value):
+        with self.lock:
+            self.input_text = value
+            self.prompt_visible = False
+            self._prompt()
+            self.stream.flush()
+
+    def refresh_size(self, *, force=False):
+        with self.lock:
+            if not self.interactive or self.rows is None:
+                return
+            now = time.monotonic()
+            if not force and now - self.last_size_check < 1:
+                return
+            self.last_size_check = now
+            self._layout()
+            self._prompt()
+            self.stream.flush()
 
     def prompt(self):
         with self.lock:
             self.input_open = True
-            self._prompt()
+            if self.interactive:
+                if self.rows is None:
+                    self._layout()
+                self._prompt()
             self.stream.flush()
 
     def input_finished(self):
         with self.lock:
+            if self.interactive and self.rows is not None:
+                self._terminal_write(f"\033[{self.rows};1H\033[2K")
+                self.stream.flush()
             self.input_open = self.prompt_visible = False
+            self.input_text = ""
+
+    def _logs(self, text):
+        if self.interactive and self.rows is not None:
+            # 一次原子写入：保存输入光标，定位日志区，输出后恢复。
+            # 不清除、不重画输入行，也不为每条日志输出提示符。
+            self.pending += text
+            end = self.pending.rfind("\n") + 1
+            if end:
+                lines, self.pending = self.pending[:end], self.pending[end:]
+                # DECRC 在部分终端会限制在日志滚动区内，VPA 保留输入列并回到底行。
+                self._terminal_write(
+                    f"\0337\033[{self.rows - 1};1H\033[2K"
+                    + lines.replace("\r\n", "\n").replace("\n", "\r\n")
+                    + f"\0338\033[{self.rows}d"
+                )
+        else:
+            self._terminal_write(text)
 
     def write(self, text):
         with self.lock:
             if self.file is not None:
                 self.file.write(ANSI_ESCAPE.sub("", text))
                 self.file.flush()
-            if self.prompt_visible:
-                # 日志另起一行，不接在黄色输入标记后，也不清掉正在键入的内容。
-                self.stream.write("\n")
-                self.prompt_visible = False
-            self.stream.write(text)
-            if text.endswith("\n"):
-                self._prompt()
+            terminal_text = text if self.ansi else ANSI_ESCAPE.sub('', text)
+            if not self.color:
+                terminal_text = re.sub(r'\x1b\[[0-9;:]*m', '', terminal_text)
+            self._logs(terminal_text)
             self.stream.flush()
         return len(text)
 
@@ -78,22 +174,59 @@ class ConsoleOutput:
     def clear(self):
         with self.lock:
             # 直接写终端，既不调用 logger，也不把控制码/提示符写入日志。
-            self.stream.write("\033[2J\033[3J\033[H")
+            if not self.ansi:
+                self._terminal_write('当前输出窗口不支持清屏。\n')
+                self.stream.flush()
+                return
+            self._terminal_write("\033[2J\033[3J\033[H")
             self.prompt_visible = False
             self._prompt()
             self.stream.flush()
 
     def close(self):
         with self.lock:
-            if self.prompt_visible:
-                self.stream.write("\n")
+            if self.pending:
+                self._logs("\n")
+            if self.rows is not None:
+                # 交还终端时恢复整个屏幕可滚动，避免影响后续 Bash 命令。
+                self._terminal_write(f"\033[r\033[{self.rows};1H\033[2K")
             self.input_open = self.prompt_visible = False
+            self.rows = None
+            self.stream.flush()
             if self.file is not None:
                 self.file.close()
                 self.file = None
 
 
-def input_lines(stream):
+def native_input_lines(on_edit=None):
+    """原生控制台逐键非阻塞读取，不悬挂同步ReadFile占用控制台句柄。"""
+    import msvcrt
+    value = ''
+    while True:
+        if not msvcrt.kbhit():
+            time.sleep(.03)
+            continue
+        char = msvcrt.getwch()
+        if char in ('\x00', '\xe0'):
+            msvcrt.getwch()  # 方向键等扩展键，不作为指令字符。
+            continue
+        if char == '\x03':
+            yield 'stop'
+            return
+        if char in ('\x04', '\x1a'):
+            return
+        if char in ('\r', '\n'):
+            yield value
+            value = ''
+        elif char == '\b':
+            value = value[:-1]
+        elif char.isprintable():
+            value += char
+        if on_edit is not None:
+            on_edit(value)
+
+
+def input_lines(stream, on_edit=None):
     """Windows 管道先检查可读字节，再读取，避免原生库初始化互锁。
 
     NumPy/OpenBLAS 初始化会检查 stdin 管道。同步管道上悬挂的阻塞读取会
@@ -117,6 +250,14 @@ def input_lines(stream):
     kind.argtypes = [ctypes.c_void_p]
     kind.restype = ctypes.c_ulong
     is_pipe = kind(handle) == 3
+    # 仅真实标准控制台使用CRT逐键输入；重定向/MSYS管道仍走PeekNamedPipe。
+    mode = ctypes.c_ulong()
+    get_mode = kernel.GetConsoleMode
+    get_mode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    get_mode.restype = ctypes.c_int
+    if stream is sys.stdin and not is_pipe and get_mode(handle, ctypes.byref(mode)):
+        yield from native_input_lines(on_edit)
+        return
     peek = kernel.PeekNamedPipe
     peek.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.c_void_p]
     peek.restype = ctypes.c_int
@@ -217,7 +358,7 @@ class ConsoleSupervisor:
     def _read_commands(self):
         if self.output is not None:
             self.output.prompt()
-        for line in input_lines(self.stream):
+        for line in input_lines(self.stream, self.output.edit_input if self.output is not None else None):
             if self.output is not None:
                 self.output.input_finished()
             self.commands.put(line.strip().casefold())
@@ -319,10 +460,14 @@ class ConsoleSupervisor:
                 env = dict(os.environ)
                 env[CONTROL_ENV] = "1"
                 env["PYTHONUNBUFFERED"] = "1"
+                env['PYTHONUTF8'] = '1'
+                env['PYTHONIOENCODING'] = 'utf-8'
                 if self.output is not None and self.log_directory is not None:
                     env[MANAGED_LOG_ENV] = "1"
+                if self.output is not None:
+                    env[CONSOLE_COLOR_ENV] = '1' if self.output.color else '0'
                 self.intent = None
-                self.child = subprocess.Popen(self.command, stdin=subprocess.PIPE, text=True, encoding="utf-8", env=env,
+                self.child = subprocess.Popen(self.command, stdin=subprocess.PIPE, text=True, encoding="utf-8", errors='replace', env=env,
                     stdout=subprocess.PIPE if self.output is not None else None,
                     stderr=subprocess.STDOUT if self.output is not None else None,
                     creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
@@ -333,6 +478,8 @@ class ConsoleSupervisor:
                 previous = self._snapshot()
                 next_scan = time.monotonic() + 1
                 while self.child.poll() is None:
+                    if self.output is not None:
+                        self.output.refresh_size()
                     try:
                         command = self.commands.get(timeout=0.2)
                     except queue.Empty:
@@ -369,7 +516,12 @@ class ConsoleSupervisor:
             if self.listener is not None:
                 self.listener.close()
             if self.control_state_path is not None:
-                self.control_state_path.unlink(missing_ok=True)
+                try:
+                    owner = json.loads(self.control_state_path.read_text(encoding='utf-8'))
+                    if owner.get('pid') == os.getpid():
+                        self.control_state_path.unlink(missing_ok=True)
+                except (OSError, ValueError):
+                    pass
             if self.output is not None:
                 self.output.close()
 
@@ -381,19 +533,13 @@ def main(argv=None):
     from backend.runtime import SOURCE_ROOT, runtime_path
 
     cfg = load_app_config(root=SOURCE_ROOT)
-    handler = logging.StreamHandler()
-    color = cfg.logging.color == "always" or (
-        cfg.logging.color == "auto"
-        and (handler.stream.isatty() or (os.environ.get("MSYSTEM") and os.environ.get("TERM", "dumb") != "dumb"))
-        and "NO_COLOR" not in os.environ
-    )
-    if color and os.name == "nt":
-        from colorama import just_fix_windows_console
-
-        just_fix_windows_console()
-    interactive = sys.stdin.isatty() or bool(os.environ.get("MSYSTEM") and os.environ.get("TERM", "dumb") != "dumb")
-    output = ConsoleOutput(handler.stream, interactive=interactive, color=color)
-    handler.setStream(output)
+    # 先初始化真实终端，再绑定日志输出；不依赖 Colorama 的旧流或不完整控制码仿真。
+    stream = sys.stderr
+    ansi = supports_ansi(stream)
+    color = use_color(cfg.logging.color, ansi)
+    interactive = ansi and interactive_input(sys.stdin)
+    output = ConsoleOutput(stream, interactive=interactive, color=color, ansi=ansi)
+    handler = logging.StreamHandler(output)
     handler.setFormatter(TaskFormatter(cfg.logging.format, cfg.logging.date_format, color=color))
     logger.handlers = [handler]
     logger.setLevel(logging.INFO)

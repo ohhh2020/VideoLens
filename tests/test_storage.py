@@ -57,7 +57,7 @@ def main() -> int:
     )
     tables = repo.table_names()
     check(
-        "七张表齐备（v4 加 qa_history）",
+        "视频、会话、分析版本与续传表齐备（v8）",
         set(tables)
         == {
             "videos",
@@ -67,6 +67,8 @@ def main() -> int:
             "tasks",
             "artifacts",
             "qa_history",
+            "conversations", "conversation_messages", "conversation_operations",
+            "uploaded_videos", "conversation_imports", "analysis_runs", "upload_sessions",
         },
         str(tables),
     )

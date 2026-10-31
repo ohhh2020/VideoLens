@@ -9,18 +9,33 @@ import sys
 import tempfile
 import time
 import unittest
+
+try:
+    import pyte
+except ImportError:
+    pyte = None
 from unittest.mock import patch
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from backend.web.console import ConsoleOutput, ConsoleSupervisor, start_control_reader, send_console_command
+from backend.web.console import ConsoleOutput, ConsoleSupervisor, start_control_reader, send_console_command, terminal_size
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_child_non_utf8_bytes_do_not_kill_log_reader(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stream=io.StringIO()
+            output=ConsoleOutput(stream,ansi=False)
+            command=[sys.executable,'-c',"import sys;sys.stdout.buffer.write(b'bad \\xff\\nafter\\n');sys.stdout.flush()"]
+            supervisor=ConsoleSupervisor(command,stream=io.StringIO(),output=output,log_directory=directory)
+            self.assertEqual(supervisor.run(),0)
+            self.assertIn('after',stream.getvalue())
+            self.assertIn('\ufffd',stream.getvalue())
+
     def test_yellow_prompt_clear_and_session_logs_are_separate(self):
         with tempfile.TemporaryDirectory() as tmp:
             terminal=io.StringIO()
@@ -48,6 +63,95 @@ class ConsoleTests(unittest.TestCase):
             self.assertTrue(second.name.endswith("-2.log"))
             self.assertEqual(path.read_text(encoding="utf-8"),"第一条日志\n")
             self.assertEqual(second.read_text(encoding="utf-8"),"第二次启动\n")
+
+    def test_git_bash_size_uses_explicit_pty_instead_of_native_controlling_tty(self):
+        with patch.dict(os.environ, {"VIDEOLENS_TERMINAL_STTY": "C:/Git/usr/bin/stty.exe",
+                                    "VIDEOLENS_TERMINAL_TTY": "/dev/pty3"}):
+            with patch("backend.web.console.subprocess.run", return_value=SimpleNamespace(
+                stdout="42 120\n", returncode=0)) as run:
+                self.assertEqual(terminal_size(), os.terminal_size((120, 42)))
+                self.assertEqual(run.call_args.args[0],
+                                 ["C:/Git/usr/bin/stty.exe", "-F", "/dev/pty3", "size"])
+
+    def test_logs_never_reprint_prompt_or_add_empty_prompt_lines(self):
+        terminal = io.StringIO()
+        output = ConsoleOutput(terminal, interactive=True, color=True,
+                               size_provider=lambda: os.terminal_size((80, 12)))
+        output.prompt()
+        before = terminal.getvalue()
+        for number in range(100):
+            output.write(f"日志 {number}\n")
+        self.assertEqual(terminal.getvalue().count("<< "), 1)
+        self.assertNotIn("<<", terminal.getvalue()[len(before):])
+        output.input_finished()
+        output.prompt()
+        self.assertEqual(terminal.getvalue().count("<< "), 2,
+                         "只有下一次输入开始才绘制提示符")
+        output.close()
+        self.assertTrue(terminal.getvalue().endswith("\033[r\033[12;1H\033[2K"))
+
+    @unittest.skipIf(pyte is None, "安装开发测试依赖 pyte 后可验证终端屏幕")
+    def test_terminal_screen_pins_prompt_and_preserves_typed_text(self):
+        screen = pyte.HistoryScreen(80, 8, history=1000)
+        emulator = pyte.Stream(screen)
+        terminal = io.StringIO()
+        output = ConsoleOutput(terminal, interactive=True, color=True,
+                               size_provider=lambda: os.terminal_size((80, 8)))
+        position = 0
+
+        def render():
+            nonlocal position
+            text = terminal.getvalue()
+            emulator.feed(text[position:])
+            position = len(text)
+
+        with tempfile.TemporaryDirectory() as tmp, closing(output):
+            output.start_session(tmp)
+            output.prompt()
+            render()
+            emulator.feed("sta")  # 模拟终端回显尚未提交的命令。
+            for number in range(100):
+                output.write(f"\033[37m日志 {number}：测试内容\033[0m\n")
+                render()
+            self.assertEqual(screen.display[-1].rstrip(), "<< sta")
+            self.assertEqual((screen.cursor.x, screen.cursor.y), (6, 7))
+            self.assertTrue(any("日志 99" in line for line in screen.display[:-1]))
+            self.assertEqual(sum("<<" in line for line in screen.display), 1)
+            for line in screen.history.top:
+                self.assertNotIn("<<", "".join(cell.data for cell in line.values()))
+            self.assertEqual(screen.buffer[7][0].fg, "brown")
+            path = Path(output.file.name)
+            output.clear()
+            render()
+            self.assertEqual(screen.display[-1].rstrip(), "<< ".rstrip())
+            self.assertTrue(all(not line.strip() for line in screen.display[:-1]))
+            output.write("清屏后的日志\n")
+            render()
+            self.assertTrue(any("清屏后的日志" in line for line in screen.display[:-1]))
+            output.close()
+            self.assertNotIn("<<", path.read_text(encoding="utf-8"))
+            self.assertNotIn("\033", path.read_text(encoding="utf-8"))
+
+    @unittest.skipIf(pyte is None, "安装开发测试依赖 pyte 后可验证终端屏幕")
+    def test_terminal_resize_moves_input_and_exit_restores_scroll_region(self):
+        screen = pyte.Screen(80, 8)
+        emulator = pyte.Stream(screen)
+        terminal = io.StringIO()
+        size = os.terminal_size((80, 8))
+        output = ConsoleOutput(terminal, interactive=True, size_provider=lambda: size)
+        output.prompt()
+        emulator.feed(terminal.getvalue())
+        position = terminal.tell()
+        screen.resize(lines=12, columns=80)
+        size = os.terminal_size((80, 12))
+        output.refresh_size(force=True)
+        emulator.feed(terminal.getvalue()[position:])
+        self.assertEqual(screen.display[-1].rstrip(), "<<")
+        self.assertEqual(sum("<<" in line for line in screen.display), 1)
+        position = terminal.tell()
+        output.close()
+        emulator.feed(terminal.getvalue()[position:])
+        self.assertIsNone(screen.margins)
 
     def test_control_pipe_stop_and_eof(self):
         for text in ('invalid\n{"command":"stop"}\n', ''):
@@ -201,7 +305,9 @@ raise SystemExit(ConsoleSupervisor([sys.executable,{str(child)!r}],port={port},w
             self.assertIn(f"Finished server process [{first}]",first_log)
             self.assertIn(f"Started server process [{second}]",second_log)
             self.assertIn(f"Finished server process [{second}]",second_log)
-            self.assertIn("\033[2J",terminal)
+            self.assertNotIn("\033",terminal,"重定向输出不应包含清屏或光标控制码")
+            self.assertIn("当前输出窗口不支持清屏",terminal)
+            self.assertNotIn("当前输出窗口不支持清屏",first_log+second_log)
             self.assertNotIn("\033[",first_log+second_log)
             self.assertNotIn("<< ",first_log+second_log)
 

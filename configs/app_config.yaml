@@ -29,7 +29,7 @@ media:
   ffmpeg_timeout_ms: 1800000
   ffprobe_timeout_ms: 30000
   download:
-    format_max_height: 720
+    format_max_height: 1080
     max_retries: 3
     backoff_base: 2.0
     backoff_max: 60.0
@@ -195,7 +195,7 @@ storage:
 api:
   host: 127.0.0.1
   port: 8000
-  max_body_bytes: 4294967296
+  max_body_bytes: 8589934592
   sse_heartbeat_s: 15
   request_timeout_s: 300
 report:
@@ -211,8 +211,8 @@ qa:
 limits:
   max_url_length: 2048
   max_duration_ms: 7200000
-  max_file_bytes: 4294967296
-  max_question_chars: 500
+  max_file_bytes: 8589934592
+  max_question_chars: 2000
   max_report_chars: 5000
   min_keyframe_short_side: 720
   timestamp_tolerance_ms: 1000
@@ -248,6 +248,7 @@ logging:
 
 ui:
   report_mode: user
+  theme_mode: system
 
 memory:
   file: data/memory/preferences.json
@@ -260,3 +261,43 @@ memory:
   dedupe_similarity: 0.92
   history_limit: 200
   batch_size: 24
+
+# 完整性版本：总预算包含提示词/历史/证据/输出预留；仅新任务使用。
+integrity:
+  enabled: true
+  scan_long_side: 640
+  scan_fps: 1.0
+  max_sample_gap_s: 10.0
+  refine_window_s: 2.0
+  refine_fps: 4.0
+  change_threshold: 0.04
+  edge_threshold: 0.08
+  evidence_long_side: 1920
+  ocr_frames: 4
+  ocr_tokens: 2048
+  summary_batch_target: 24
+  summary_batch_max: 32
+  summary_input_tokens: 12000
+  summary_output_tokens: 2048
+  report_input_tokens: 24000
+  report_output_tokens: 4096
+  qa_local_k: 6
+  qa_global_k: 20
+  qa_local_input_tokens: 8000
+  qa_global_input_tokens: 24000
+  qa_local_output_tokens: 2048
+  qa_global_output_tokens: 4096
+  qa_extra_rounds: 2
+  max_continuations: 2
+  cloud_total: 8
+  cloud_text: 4
+  cloud_vision: 8
+  cloud_retries: 3
+  gpu_batch_max: 16
+  asr_batch_max: 8
+  upload_chunk_bytes: 8388608
+  upload_ttl_hours: 24
+  disk_reserve_bytes: 5368709120
+  warning_requests: 200
+  input_price_per_million: 0.0
+  output_price_per_million: 0.0

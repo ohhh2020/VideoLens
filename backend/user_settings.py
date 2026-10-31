@@ -77,11 +77,18 @@ SETTABLE_KEYS: Final[dict[str, type]] = {
     "embedding.text_device": str,
     "embedding.image_device": str,
     "ui.report_mode": str,
+    "ui.theme_mode": str,
     # 注意：这里不放 models.preload —— AppConfig 的 ModelsSection 没有该字段，
     # 严格模式下写进去会让下一次 load_app_config 直接 UnknownConfigKeyError。
     # ---- 检索 ----
     "retrieval.top_k": int,
 }
+
+from dataclasses import fields as _policy_fields
+from backend.analysis.policy import IntegritySection as _IntegritySection
+SETTABLE_KEYS.update({"integrity." + field.name: field.type for field in _policy_fields(_IntegritySection) if field.name not in {'enabled', 'upload_chunk_bytes', 'upload_ttl_hours'}})
+SETTABLE_KEYS.update({"media.download.format_max_height": int, "limits.max_file_bytes": int,
+                     "limits.max_duration_ms": int, "limits.max_question_chars": int})
 
 #: 允许的三个枚举值（写错会让配置校验抛错，不如这里先挡）。
 _ENUMS: Final[dict[str, tuple[str, ...]]] = {
@@ -92,6 +99,7 @@ _ENUMS: Final[dict[str, tuple[str, ...]]] = {
     "embedding.text_device": ("cpu", "cuda"),
     "embedding.image_device": ("cpu", "cuda"),
     "ui.report_mode": ("user", "detailed"),
+    "ui.theme_mode": ("system", "light", "dark"),
 }
 
 #: 这些键是密钥：读出来时打码，写日志时永不落明文。

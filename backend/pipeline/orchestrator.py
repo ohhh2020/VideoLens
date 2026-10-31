@@ -119,7 +119,7 @@ class Orchestrator(
         return messages
 
     def _notify_memory(self):
-        if self._memory is not None:
+        if self._memory is not None and not getattr(self, "_suppress_memory_notify", False):
             self._memory.notify()
 
     def _require_cloud_ready(self):
@@ -143,6 +143,9 @@ class Orchestrator(
         with log_task(
             f"analyze:{getattr(options, 'task_id', '') or Path(source).name[:40]}"
         ):
+            if getattr(self, "_use_integrity", False) and self._cfg.integrity.enabled:
+                from backend.analysis.runs import execute
+                return execute(self, source, options or AnalyzeOptions())
             return self._analyze(source, options)
 
     def _analyze(self, source, options=None):
@@ -172,8 +175,8 @@ class Orchestrator(
 
             # 同视频串行：后来者等先到者完成后走快路径（复用结果/断点续跑），
             # 绝不并行跑两条全量流水线。见 _VIDEO_LOCKS 的注释。
-            video_guard = _video_lock(video_id)
-            if not video_guard.acquire(timeout=0.5):
+            video_guard = None if getattr(self, "_isolated_run", False) else _video_lock(video_id)
+            if video_guard is not None and not video_guard.acquire(timeout=0.5):
                 logger.info("video_id=%s 已有分析在运行，排队等待其完成", video_id)
                 report.warnings.append("同视频已有任务在运行，已排队等待（未重复计算）")
                 video_guard.acquire()
@@ -296,6 +299,9 @@ class Orchestrator(
                 transcript = self._transcribe(
                     video_id, audio_path, local_path, probe_info, opts
                 )
+            if getattr(self, '_analysis_run', None) is not None and not reused:
+                self._analysis_run.put('transcript_raw', {'source': transcript.source, 'language': transcript.language,
+                    'segments': [segment.to_dict() for segment in transcript.segments]})
             ctx["transcript"] = transcript
             report.transcript_source = str(getattr(transcript, "source", "") or "")
             report.language = str(getattr(transcript, "language", "") or "")
@@ -673,6 +679,11 @@ class Orchestrator(
         恒为生成器且以 ``("final", AskResult)`` 收尾；``stream=False`` 时
         不产出 meta/delta，只给 final（ask() 的消费形态）。
         """
+        if getattr(self, '_use_integrity', False) and self._cfg.integrity.enabled:
+            from backend.analysis.qa import ask
+            yield from ask(self, video_id, question, top_k=top_k, max_context_tokens=max_context_tokens,
+                           stream=stream, session_id=session_id)
+            return
         started = time.monotonic()
         result = AskResult(question=question, video_id=video_id)
         text = (question or "").strip()
@@ -913,11 +924,32 @@ class Orchestrator(
             logger.debug("查询改写失败，使用原问题: %s", exc)
             return ""
 
-    def delete(self, video_id: str) -> dict[str, Any]:
-        """删视频及其向量与磁盘产物（``DELETE /videos/{id}`` 的后端）。"""
+    def delete(self, video_id: str, *, missing_ok=False) -> dict[str, Any]:
+        """两个网页删除入口共用：视频、所有会话、索引与受管缓存一起清理。"""
+        from backend.storage.lifecycle import video_guard
+        from backend.storage.repository import RepositoryError
+        with video_guard(video_id):
+            lock = _video_lock(video_id)
+            if not lock.acquire(blocking=False):
+                raise PipelineError('该视频正在分析，请等待当前任务完成后删除')
+            try:
+                self._repo.ensure_video_idle(video_id)
+                if not missing_ok and self._repo.find_video(video_id) is None:
+                    return {'video_id': video_id, 'db_error': '视频不存在'}
+                return self._delete_linked_video(video_id, missing_ok=missing_ok)
+            except RepositoryError as exc:
+                raise PipelineError(str(exc)) from exc
+            finally:
+                lock.release()
+
+    def _delete_linked_video(self, video_id, *, missing_ok=False):
+        from backend.pipeline.deletion import attachment_paths, purge_uploads
+        from backend.pipeline.chat_sessions import get_chat_store
+        conversations = self._repo._query('SELECT id FROM conversations WHERE video_id=?', (video_id,))
+        uploads = attachment_paths(self._repo, video_id=video_id)
         with self._bm25_lock:
             self._bm25_cache.pop(video_id, None)
-        removed: dict[str, Any] = {"video_id": video_id}
+        removed: dict[str, Any] = {"video_id": video_id, 'conversation_ids': [row['id'] for row in conversations]}
         generation = ""
         local_path = ""
         try:
@@ -935,12 +967,18 @@ class Orchestrator(
                 removed["vectors"] = self._vectors.delete_video(video_id)
         except Exception as exc:  # noqa: BLE001
             removed["vectors_error"] = str(exc)
+            return removed
         try:
-            doomed = self._repo.delete_video(video_id)
+            doomed = self._repo.delete_video(video_id, missing_ok=missing_ok)
             removed["db"] = doomed
+            get_chat_store().clear(video_id)
             # 库删了文件不能留：关键帧 JPG 与音频 WAV 都在按 video_id 命名的
             # 目录里，漏删一次就是几 MB 的孤儿数据，且再也无法从库里定位。
             removed["files"] = self.purge_files(video_id, doomed, local_path=local_path)
+            if getattr(self, "_use_integrity", False):
+                from backend.analysis.runs import purge_versions
+                removed["analysis_versions"] = purge_versions(self, video_id)
+            removed['uploads'] = purge_uploads(self._repo, self._cfg, uploads)
         except Exception as exc:  # noqa: BLE001
             removed["db_error"] = str(exc)
         return removed
@@ -969,10 +1007,14 @@ class Orchestrator(
         if stray:
             removed["stray"] = stray
         if local_path:
-            _unlink_owned(
-                Path(local_path),
-                [Path(self._cfg.path(tag)) for tag in ("videos", "temp")],
-            )
+            from backend.pipeline.deletion import referenced_files, file_key
+            referenced = referenced_files(self._repo) if hasattr(self, '_repo') else set()
+            if file_key(local_path) not in referenced:
+                _unlink_owned(
+                    Path(local_path),
+                    [Path(self._cfg.path(tag)) for tag in ("videos", "temp")]
+                    + [Path(self._cfg.path("data")) / "uploads"],
+                )
             if not Path(local_path).exists():
                 removed["source"] = 1
         return removed
@@ -1044,7 +1086,7 @@ class Orchestrator(
         if kf_records:
             keyframes = _restore_keyframes(kf_records)
             alive = len(keyframes) / len(kf_records)
-            if keyframes and alive >= 0.8:
+            if keyframes and alive >= (1.0 if getattr(self, "_analysis_run", None) is not None else 0.8):
                 ready["keyframes"] = keyframes
             else:
                 logger.info(
@@ -1060,6 +1102,11 @@ class Orchestrator(
     def _resume_point(self, video_id: str, opts: AnalyzeOptions) -> Stage | None:
         if not opts.resume or opts.force:
             return None
+        if getattr(self, '_analysis_run', None) is not None:
+            progress = self._analysis_run.get('progress') or {}
+            for stage in Stage:
+                if stage.value == progress.get('stage') and stage is not Stage.DONE:
+                    return stage
         video = self._repo.find_video(video_id)
         if video is None or video.status == "ready":
             return None
@@ -1094,6 +1141,12 @@ class Orchestrator(
         *,
         parallel_result: bool = False,
     ) -> StageReport:
+        if getattr(self, '_analysis_run', None) is not None:
+            previous = (self._analysis_run.get('progress') or {}).get('stage')
+            previous_order = next((item.order for item in Stage if item.value == previous), -1)
+            # 重试仍先经过解析/探测；不能把已完成的昂贵阶段检查点写回parse。
+            if stage.order > previous_order:
+                self._analysis_run.put('progress', {'stage': stage.value})
         item = StageReport(stage=stage, started_at=time.monotonic())
         report.stages.append(item)
         logger.info(

@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from difflib import SequenceMatcher
 from functools import lru_cache
 import re
 import time
@@ -80,7 +79,7 @@ class AsrConfig:
     compression_ratio_threshold: float = 2.4
     initial_prompt: str = "以下是普通话视频的转写内容，请使用简体中文并添加标点。"
     max_repeat_ratio: float = 0.6
-    """单段文本与上一段相似度超过该比例则判为复读幻觉（0.6 = 60%）。"""
+    """兼容旧配置字段；仅删除时间重叠且逐字相同的重复结果，不再按相似度丢弃。"""
 
     def validate(self) -> None:
         if self.device not in {None, "auto", "cuda", "cpu", "mps"}:
@@ -252,20 +251,6 @@ def _looks_like_hallucination(text: str) -> bool:
     return any(p.match(stripped) for p in _HALLUCINATION_PATTERNS)
 
 
-def _similarity(a: str, b: str) -> float:
-    """复读识别：看"序列是否也一致"，不看"用了哪些字"。
-
-    早期版本用字符集合 Jaccard，在中文上勉强可用，在英文上必失效 ——
-    两段毫不相干的英文都由同样 26 个字母组成，集合重叠 0.85 以上，于是
-    正常的第二句被当成复读丢弃（实测 11 秒英文音频只留下第一句，
-    WER 从 4% 虚高到 55%）。``SequenceMatcher`` 比值要求顺序也吻合，
-    真复读才会接近 1.0，正常相邻句通常在 0.3 以下。
-    """
-    if not a or not b:
-        return 0.0
-    return SequenceMatcher(None, a, b, autojunk=False).ratio()
-
-
 def _clean_text(text: str) -> str:
     cleaned = re.sub(r"[ \t]{2,}", " ", text.replace("\n", " ")).strip()
     return cleaned
@@ -281,7 +266,7 @@ def _cuda_usable() -> bool:
     CPU 上跑"的一个来源。torch 只作为没有 CT2 时的旁证。
 
     若 CUDA 运行库损坏（缺 cublas 等），首个 float16 档会在 load() 里抛错并
-    沿设备计划快速降级到 CPU（秒级代价，不是分钟级），因此这里宁可乐观。
+    明确报错并保留用户选择的设备，不会自动切换CPU。
     """
     from backend.models._runtime import ensure_cuda_dlls, ensure_torch_path  # noqa: PLC0415
 
@@ -323,10 +308,9 @@ class AsrEngine:
         self._transcribe_lock = threading.Lock()
         self._model: Any = None
         self._loaded_key: tuple[str, str, str] | None = None
-        # D1：转写期 CUDA 运行库炸掉（典型：cublas64_12.dll 缺失，cuBLAS 惰性
-        # 加载，加载期探测不到）后置 True，强制后续按 CPU 计划重载重试。
-        self._force_cpu: bool = False
-
+        self._learned_batch = 4
+        self._batch_peak = 0
+        self.last_batch_size = 1
     # ---- 模型加载 --------------------------------------------------------- #
     def _manager(self) -> Any:
         if self._model_manager is None:
@@ -428,6 +412,7 @@ class AsrEngine:
         subtitles: Iterable[str | Path] = (),
         duration_ms: int | None = None,
         allow_subtitle: bool | None = None,
+        max_batch: int | None = None,
     ) -> Transcript:
         """转写入口：字幕优先，失败退回 Whisper，再失败返回空结果。
 
@@ -457,6 +442,7 @@ class AsrEngine:
                 video_id=video_id,
                 duration_ms=duration_ms,
                 warnings=warnings,
+                max_batch=max_batch,
             )
         return replace(transcript, elapsed_ms=int((time.monotonic() - started) * 1000))
 
@@ -523,7 +509,7 @@ class AsrEngine:
             if _looks_like_hallucination(text):
                 dropped += 1
                 continue
-            if previous and _similarity(previous, text) >= self.config.max_repeat_ratio:
+            if segments and previous == text and cue.start_ms < segments[-1].end_ms:
                 dropped += 1
                 continue
             start = max(0, cue.start_ms)
@@ -546,6 +532,7 @@ class AsrEngine:
         video_id: str,
         duration_ms: int | None,
         warnings: list[str],
+        max_batch: int | None = None,
     ) -> Transcript:
         path = Path(audio_path)
         if not path.is_file():
@@ -574,21 +561,33 @@ class AsrEngine:
         if self.config.language is None or self.config.language.startswith("zh"):
             options["initial_prompt"] = self.config.initial_prompt
 
-        try:
-            if self.config.batch_size > 1:
-                from faster_whisper import BatchedInferencePipeline
-
-                # 实例按请求创建；内部时间戳状态不能在并发转写之间共享。
-                runner = BatchedInferencePipeline(model=model)
-                raw_segments, info = runner.transcribe(
-                    str(path), batch_size=self.config.batch_size, **options
-                )
-            else:
-                raw_segments, info = model.transcribe(str(path), **options)
-            # Whisper 在迭代时才真正推理，CUDA 错误也可能直到此时才发生。
-            segments_list = list(raw_segments)
-        except Exception as exc:
-            raise AsrError(f"Whisper 转写失败：{type(exc).__name__}: {exc}") from exc
+        from backend.models.batching import is_oom, release_oom
+        from backend.models.batching import GpuMemoryProbe
+        maximum = max(1, min(8, max_batch or self.config.batch_size))
+        batch = min(maximum, self._learned_batch, self.config.batch_size if not device.startswith('cuda') else maximum)
+        while True:
+            try:
+                if batch > 1:
+                    from faster_whisper import BatchedInferencePipeline
+                    runner = BatchedInferencePipeline(model=model)
+                    raw_segments, info = runner.transcribe(str(path), batch_size=batch, **options)
+                else:
+                    raw_segments, info = model.transcribe(str(path), **options)
+                with GpuMemoryProbe(device) as probe:
+                    segments_list = list(raw_segments)
+                self.last_batch_size = batch
+                self._batch_peak = max(self._batch_peak, probe.used)
+                self._learned_batch = batch
+                if device.startswith('cuda') and probe.minimum > max(256*1024**2, self._batch_peak) * 3:
+                    self._learned_batch = min(maximum, batch * 2)
+                logger.info('Whisper批次完成 actual_batch=%d peak_device_delta=%.1fMiB next_batch=%d', batch, probe.used/1024**2, self._learned_batch)
+                break
+            except Exception as exc:
+                if not device.startswith('cuda') or not is_oom(exc) or batch == 1:
+                    raise AsrError(f"Whisper 转写失败：{type(exc).__name__}: {exc}") from exc
+                release_oom(exc)
+                batch = max(1, batch // 2)
+                logger.warning('Whisper显存不足，缩小批次至%d，保持CUDA设备', batch)
         language = str(getattr(info, "language", "") or "")
         probability = float(getattr(info, "language_probability", 0.0) or 0.0)
         if probability and probability < self.config.min_language_probability:
@@ -605,7 +604,7 @@ class AsrEngine:
             if _looks_like_hallucination(text):
                 dropped += 1
                 continue
-            if previous and _similarity(previous, text) >= self.config.max_repeat_ratio:
+            if previous and previous == text and int(round(float(getattr(raw, "start", 0.0)) * 1000)) < last_end:
                 dropped += 1
                 continue
             start = int(round(float(getattr(raw, "start", 0.0)) * 1000))

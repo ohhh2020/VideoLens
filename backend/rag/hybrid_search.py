@@ -1043,7 +1043,7 @@ class HybridSearcher:
         """执行混合检索。
 
         Args:
-            query: 自然语言查询（≤500 字符，超长会被截断并告警）。
+            query: 自然语言查询，保留原始问题及检索补充。
             top_k: 返回条数，缺省用配置值。
             filters: 透传给向量通道的元数据过滤（如 ``{"video_id": "v1"}``）。
             min_score: 覆盖配置里的归一化分数下限。
@@ -1052,9 +1052,6 @@ class HybridSearcher:
         text = (query or "").strip()
         if not text:
             raise HybridSearchError("查询文本不能为空")
-        if len(text) > 500:
-            self._log.warning("查询长度 %d 超过 500 字符，已截断", len(text))
-            text = text[:500]
 
         limit = self._cfg.top_k if top_k is None else int(top_k)
         if limit < 1:

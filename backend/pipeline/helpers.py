@@ -215,6 +215,8 @@ def _item_with_text(item: Any, text: str) -> Any:
     if isinstance(item, dict):
         clone = dict(item)
         clone["text"] = text
+        clone["core_text"] = text
+        clone["evidence_text"] = text
         return clone
     try:
         return _dc_replace(item, text=text)
@@ -550,6 +552,12 @@ def _unlink_owned(path: Path, roots: Sequence[Path]) -> bool:
     只有下载缓存在 ``data/videos``、``data/temp`` 里的副本才归系统管。
     """
     try:
+        if path.is_symlink():
+            # 先验证链接本身所在目录，再unlink链接；绝不能resolve后删除原视频。
+            if any(path.parent.resolve().is_relative_to(root.resolve()) for root in roots):
+                path.unlink(missing_ok=True)
+                return True
+            return False
         target = path.resolve()
     except OSError:
         return False

@@ -12,10 +12,11 @@ from datetime import datetime
 from pathlib import Path
 
 from backend.runtime import runtime_path
+from backend.terminal import CONSOLE_COLOR_ENV, supports_ansi, use_color
 
 _TASK = contextvars.ContextVar("videolens_log_task", default="")
 MANAGED_LOG_ENV = "VIDEOLENS_MANAGED_LOG"
-ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|[0-9@-Z\\-_])")
 
 
 def open_session_log(directory, *, date=None):
@@ -106,20 +107,12 @@ def configure_logging(cfg):
     if getattr(root, "_zhiying_configured", False):
         return
     root.setLevel(cfg.logging.level)
-    console = logging.StreamHandler()
-    color = cfg.logging.color == "always" or (
-        cfg.logging.color == "auto"
-        and (
-            console.stream.isatty()
-            or (os.environ.get("MSYSTEM") and os.environ.get("TERM", "dumb") != "dumb")
-        )
-        and "NO_COLOR" not in os.environ
-    )
-    if color and os.name == "nt":
-        # colorama 已随 uvicorn[standard] 安装；修复原生 Windows 控制台的 ANSI 支持。
-        from colorama import just_fix_windows_console
-
-        just_fix_windows_console()
+    import sys
+    stream = sys.stderr
+    managed = os.environ.get(MANAGED_LOG_ENV) == '1'
+    ansi = (os.environ[CONSOLE_COLOR_ENV] == '1') if managed and CONSOLE_COLOR_ENV in os.environ else supports_ansi(stream)
+    color = use_color(cfg.logging.color, ansi)
+    console = logging.StreamHandler(stream)
     console.setFormatter(
         TaskFormatter(cfg.logging.format, cfg.logging.date_format, color=color)
     )

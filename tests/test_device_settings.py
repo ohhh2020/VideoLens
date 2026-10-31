@@ -52,10 +52,10 @@ class DeviceSettingsTests(unittest.TestCase):
                 self.assertEqual(siglip.call_args.kwargs["device"], image)
                 self.assertEqual(AsrConfig.from_config(cfg).device, asr)
                 self.assertEqual(
-                    bge.call_args.kwargs["batch_size"], 4 if text == "cuda" else 16
+                    bge.call_args.kwargs["batch_size"], cfg.integrity.gpu_batch_max if text == "cuda" else 16
                 )
                 self.assertEqual(
-                    siglip.call_args.kwargs["batch_size"], 4 if image == "cuda" else 16
+                    siglip.call_args.kwargs["batch_size"], cfg.integrity.gpu_batch_max if image == "cuda" else 16
                 )
 
     def test_legacy_shared_device_remains_compatible(self):
@@ -81,6 +81,7 @@ class DeviceSettingsTests(unittest.TestCase):
                     "asr.compute_type": "float16",
                     "embedding.text_device": "cuda",
                     "ui.report_mode": "detailed",
+                    "ui.theme_mode": "dark",
                 },
                 root=root,
             )
@@ -92,6 +93,7 @@ class DeviceSettingsTests(unittest.TestCase):
             self.assertEqual(cfg.embedding.image_device, "cpu")
             self.assertEqual(cfg.embedding.text_device, "cuda")
             self.assertEqual(cfg.ui.report_mode, "detailed")
+            self.assertEqual(cfg.ui.theme_mode, "dark")
             self.assertEqual(
                 AsrEngine(AsrConfig.from_config(cfg))._device_plan(),
                 [("cuda", "float16")],
@@ -103,6 +105,7 @@ class DeviceSettingsTests(unittest.TestCase):
             ("embedding.text_device", "mps"),
             ("embedding.image_device", "gpu"),
             ("ui.report_mode", "hidden"),
+            ("ui.theme_mode", "purple"),
         ):
             with self.assertRaises(SettingsError):
                 validate_settings({key: value})
@@ -185,11 +188,13 @@ class DeviceSettingsTests(unittest.TestCase):
                         "embedding.text_device": "cpu",
                         "embedding.image_device": "cuda",
                         "ui.report_mode": "detailed",
+                    "ui.theme_mode": "dark",
                     },
                 )
                 self.assertEqual(response.status_code, 200, response.text)
                 data = response.json()
                 self.assertEqual(data["effective"]["ui.report_mode"], "detailed")
+                self.assertEqual(data["effective"]["ui.theme_mode"], "dark")
                 self.assertEqual(data["effective"]["embedding.text_device"], "cpu")
                 self.assertEqual(data["effective"]["embedding.image_device"], "cuda")
                 self.assertEqual(data["active_devices"]["faster-whisper-small"], "cpu")

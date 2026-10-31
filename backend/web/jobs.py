@@ -201,6 +201,9 @@ class JobStore:
         同一 source 已有排队/运行中的任务时，**返回那个任务**（task_id 不变）——
         调用方拿到的 202 与进度流都指向同一份执行，重复点击不会翻倍计算。
         """
+        from backend.analysis.runs import snapshot
+        if hasattr(orch, "_cfg"):
+            options.policy_snapshot = snapshot(orch._cfg)
         key = _source_key(source)
         with self._lock:
             existing_id = self._inflight.get(key)

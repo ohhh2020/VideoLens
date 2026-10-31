@@ -3,18 +3,25 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>知影 · 分析工作台</title>
-<link rel="stylesheet" href="/assets/workbench/style.css">
-<link rel="stylesheet" href="/assets/shared/markdown.css">
+<title>知影 · 视频对话工作台</title>
+<script>
+/* 首屏同步读取主题，避免深色模式刷新闪白。 */
+try{const m=localStorage.getItem('videolens.theme')||'system';const t=m==='dark'||(m==='system'&&matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';document.documentElement.dataset.theme=t;document.documentElement.style.colorScheme=t}catch(e){}
+</script>
+<link rel="stylesheet" href="/assets/workbench/style.css?v=local-links-v1">
+<link rel="stylesheet" href="/assets/shared/markdown.css?v=local-links-v1">
 </head>
 <body>
 <div class="wrap">
   <div class="nav">
-    <div class="brand">知影 ZhiYing <small>本地优先 · 视频智能分析</small></div>
+    <div class="brand">知影 <span class="brand-en">VideoLens</span><small>让视频成为可对话的知识</small></div>
     <div class="spacer"></div>
-    <a class="primary" href="/chat">💬 视频对话</a>
+    <fluent-button type="button" appearance="subtle" class="btn ghost" id="draftNew">新对话</fluent-button>
+    <fluent-button type="button" appearance="subtle" class="btn ghost" id="historyToggle" aria-label="展开历史对话" aria-controls="historySidebar" aria-expanded="false">历史对话</fluent-button>
+    <label class="sr-only" for="themeQuick">界面主题</label>
+    <select id="themeQuick" class="theme-quick" aria-label="界面主题"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select>
     <details class="service-menu" id="serviceMenu">
-      <summary aria-label="服务菜单">菜单 <span aria-hidden="true">▾</span></summary>
+      <summary aria-label="服务菜单">服务菜单</summary>
       <div class="service-dropdown">
         <button type="button" id="serviceRestart">重启</button>
         <button type="button" id="serviceStop" class="service-stop">关闭</button>
@@ -23,53 +30,52 @@
   </div>
   <div class="service-notice" id="serviceNotice" role="status" hidden></div>
 
-  <div class="tabs">
-    <button data-t="analyze" class="on">🎬 分析</button>
-    <button data-t="library">📚 视频库</button>
-    <button data-t="status">📊 状态</button>
-    <button data-t="settings">⚙️ 设置</button>
-    <button data-t="memory">🧠 记忆库</button>
-  </div>
+  <nav class="tabs" aria-label="工作区导航">
+    <fluent-button type="button" appearance="subtle" data-t="analyze" aria-pressed="true" class="on">视频对话</fluent-button>
+    <fluent-button type="button" appearance="subtle" data-t="library">视频库</fluent-button>
+    <fluent-button type="button" appearance="subtle" data-t="status">运行状态</fluent-button>
+    <fluent-button type="button" appearance="subtle" data-t="settings">设置</fluent-button>
+    <fluent-button type="button" appearance="subtle" data-t="memory">记忆库</fluent-button>
+  </nav>
 
   <!-- ============ 分析 ============ -->
   <section class="tabpane on" id="p-analyze">
-    <div class="card">
-      <h3>提交分析任务</h3>
-      <p class="warnline" id="pendingDevices" role="status" hidden></p>
-      <label>视频来源（本地路径或链接）</label>
-      <textarea id="src" rows="2" placeholder="D:\videos\demo.mp4 或 https://www.bilibili.com/video/BVxxx"></textarea>
-      <div class="grid" style="margin-top:12px">
-        <div><label>标题（可选）</label><input type="text" id="title" placeholder="留空自动生成"></div>
-        <div><label>语言（可选）</label>
-          <select id="lang"><option value="">自动检测</option><option value="zh">中文</option><option value="en">英文</option></select></div>
-      </div>
-      <div class="checks">
-        <label><input type="checkbox" id="force">强制重跑</label>
-        <label><input type="checkbox" id="skipVision">跳过视觉理解（更快）</label>
-        <label><input type="checkbox" id="skipSummary">跳过总结</label>
-        <label><input type="checkbox" id="skipVectors">跳过向量入库</label>
-      </div>
-      <button class="btn" id="go">开始分析</button>
-      <span class="savehint" id="analyzeHint"></span>
-      <div class="prog" id="progWrap" style="display:none"><i id="prog"></i></div>
-      <div class="logline" id="progText"></div>
-    </div>
-    <div class="card" id="resultCard" style="display:none">
-      <h3 id="resultTitle">分析结果</h3>
-      <div id="resultBody" style="font-size:13px"></div>
-      <div id="transcriptBox" style="display:none;margin-top:10px">
-        <div style="display:flex;align-items:center;gap:10px">
-          <b style="font-size:13px">📝 语音转写结果</b>
-          <span class="savehint" id="transcriptMeta"></span>
-        </div>
-        <div id="transcriptBody" style="max-height:420px;overflow-y:auto;margin-top:8px;
-             background:var(--panel2);border:1px solid var(--border);border-radius:10px;
-             padding:10px 14px;font-size:12.5px;line-height:1.7"></div>
-      </div>
-      <div style="margin-top:10px;display:flex;gap:14px;align-items:center">
-        <a class="tlink" id="goChat" href="#">💬 去对话页追问 →</a>
-        <a class="tlink" id="exportMd" href="#" style="color:var(--ok)">📄 一键导出报告 MD</a>
-        <a class="tlink" data-detail-only id="toggleTranscript" href="#">📝 转写结果</a>
+    <div class="conversation-layout">
+      <button type="button" class="history-backdrop" id="historyBackdrop" aria-label="关闭历史对话" hidden></button>
+      <aside class="history-sidebar" id="historySidebar" aria-label="历史对话" hidden>
+        <fluent-button type="button" class="btn" id="newConversation">新对话</fluent-button>
+        <div class="history-heading">历史对话 <button type="button" id="historyClose" aria-label="收起历史">收起</button></div>
+        <div id="conversationList"></div>
+        <button type="button" class="btn ghost" id="moreConversations" hidden>加载更多</button>
+      </aside>
+      <div class="conversation-main" id="conversationMain">
+        <div class="conversation-heading"><b id="conversationTitle">视频对话</b><span>一个视频，一段深入对话</span></div>
+        <p class="warnline" id="pendingDevices" role="status" hidden></p>
+        <details class="video-panel" id="videoPanel" hidden><summary>视频播放 · 点击引用可跳转时间</summary>
+          <video id="player" controls preload="metadata"></video><p id="playerHint" class="muted"></p>
+        </details>
+        <div class="conversation-flow" id="conversationFlow" role="log" aria-label="视频分析与对话"></div>
+        <div class="operation-status" id="operationStatus" role="status" hidden></div>
+        <form class="conversation-composer" id="composer">
+          <div class="attachment-preview" id="attachmentPreview" hidden></div>
+          <label class="sr-only" for="messageInput">输入视频链接、分析要求或视频问题</label>
+          <textarea id="messageInput" rows="2" maxlength="8000" placeholder="选择本地视频，或粘贴视频分享链接，也可以附上想问的问题…"></textarea>
+          <div class="composer-toolbar">
+            <fluent-button type="button" appearance="subtle" class="btn ghost" id="attachVideo">选择本地视频</fluent-button>
+            <details id="analysisOptions"><summary>分析选项</summary><div class="analysis-options-body">
+              <label>标题（可选）<input type="text" id="title" maxlength="200" placeholder="自动生成"></label>
+              <label>语言<select id="lang"><option value="">自动检测</option><option value="zh">中文</option><option value="en">英文</option></select></label>
+              <div class="checks">
+                <label><input type="checkbox" id="force">强制重跑</label>
+                <label><input type="checkbox" id="skipVision">跳过视觉理解</label>
+                <label><input type="checkbox" id="skipSummary">跳过总结</label>
+                <label><input type="checkbox" id="skipVectors">跳过向量入库</label>
+              </div></div>
+            </details>
+            <span class="composer-help">本地视频使用原文件 · Enter 发送 · Shift+Enter 换行</span>
+            <fluent-button type="button" appearance="primary" class="btn" id="sendMessage">发送</fluent-button>
+          </div>
+        </form>
       </div>
     </div>
   </section>
@@ -126,11 +132,21 @@
       <p class="muted">三个模型独立选择；保存后等待当前推理结束并切换，无需重启。目标设备加载失败时保留原模型和设置。</p>
     </div>
     <div class="card">
+      <h3>界面主题</h3>
+      <label for="theme_mode">外观</label>
+      <select id="theme_mode"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select>
+      <p class="muted">立即切换并保存，无需重启。浅色柔白、深色深灰，使用低饱和中性色。</p>
+    </div>
+    <div class="card">
       <h3>分析报告显示</h3>
       <label for="report_mode">显示模式</label>
       <select id="report_mode"><option value="user">用户模式：内容概览与关键结论</option><option value="detailed">详细模式：完整报告与分析信息</option></select>
       <p class="muted">选择后立即预览当前完整报告；保存后记住偏好并同步其他打开的工作台。切换不重新分析，也不删除完整报告内容。</p>
     </div>
+    <details class="card" id="qualitySettings"><summary>分析质量与资源</summary>
+        <p class="muted">新分析采用固定间隔采样、整帧识别与单次报告，不执行局部加密、高清裁图或分层章节摘要。报告均匀取样最多32个切片，原始证据另存；新设置仅影响之后创建的任务。总预算按UTF-8字节保守估算，实际用量以服务商返回为准。本地视频通过软链接读取原文件，最多2小时 / 8 GiB。价格留0时只统计请求与tokens。</p>
+      <div id="qualityFields"></div>
+    </details>
     <button class="btn" id="saveSet">保存设置</button>
     <span class="savehint" id="saveSetHint">本地模型设备和报告显示无需重启；云端及其他后端设置变更仍需重启</span>
     <div class="card" style="margin-top:14px"><h3>当前通道状态</h3><div id="setBackends"></div></div>
@@ -145,7 +161,7 @@
       </div>
       <button class="btn ghost" id="memoryRefresh">从历史更新</button>
       <button class="btn ghost" id="memoryReload">刷新列表</button>
-      <a href="#memoryNew" class="tlink">＋增加记忆</a>
+      <a href="#memoryNew" class="tlink">增加记忆</a>
       <p id="memoryStatus" class="muted" role="status"></p>
       <p class="muted">关闭自动归纳后仍可手动编辑。删除会移除文字和向量，不会从相同的已处理历史重复生成；新的历史仍可形成新记忆。</p>
     </div>
@@ -163,6 +179,8 @@
 </div>
 <div class="toast" id="toast"></div>
 
+<script src="/assets/vendor/fluent-ui.min.js?v=local-links-v1" defer></script>
+<script src="/assets/workbench/theme.js?v=local-links-v1" defer></script>
 <script src="/assets/vendor/marked.umd.js" defer></script>
 <script src="/assets/vendor/purify.min.js" defer></script>
 <script src="/assets/shared/markdown.js" defer></script>
@@ -170,6 +188,8 @@
 <script src="/assets/workbench/memory.js" defer></script>
 <script src="/assets/workbench/service.js" defer></script>
 <script src="/assets/workbench/keys.js" defer></script>
-<script src="/assets/workbench/app.js" defer></script>
+<script src="/assets/workbench/quality.js?v=local-links-v1" defer></script>
+<script src="/assets/workbench/conversations.js?v=local-links-v1" defer></script>
+<script src="/assets/workbench/app.js?v=local-links-v1" defer></script>
 </body>
 </html>

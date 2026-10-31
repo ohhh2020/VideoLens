@@ -100,6 +100,29 @@ class DownloaderUnavailable(MediaError):
     """yt-dlp 未安装或版本过旧，无法执行下载。"""
 
 
+def quality_selector(limit, merged=False):
+    """所有回退都遵守短边清晰度限制，竖屏按宽度选择。"""
+    def select(context):
+        formats = context.get('formats') or []
+        videos = [f for f in formats if f.get('vcodec') != 'none'
+                  and (not f.get('width') or not f.get('height') or min(f['width'], f['height']) <= limit)
+                  and (not merged or f.get('acodec') != 'none')]
+        if not videos:
+            return
+        video = max(videos, key=lambda f: (min(f.get('width') or 0, f.get('height') or 0),
+                                             f.get('fps') or 0, f.get('tbr') or 0))
+        if video.get('acodec') != 'none':
+            yield video
+            return
+        audio = [f for f in formats if f.get('vcodec') == 'none' and f.get('acodec') != 'none']
+        if not audio:
+            return
+        track = max(audio, key=lambda f: (f.get('abr') or f.get('tbr') or 0))
+        yield {'format_id': video['format_id'] + '+' + track['format_id'], 'ext': 'mp4',
+               'requested_formats': [video, track], 'protocol': video.get('protocol', 'https') + '+' + track.get('protocol', 'https')}
+    return select
+
+
 # --------------------------------------------------------------------------- #
 # 配置
 # --------------------------------------------------------------------------- #
@@ -118,9 +141,10 @@ class DownloadConfig:
     resume: bool = True
     cookies_from_browser: str | None = None
     cookie_file: Path | None = None
-    max_file_bytes: int | None = 4 * 1024**3
+    max_file_bytes: int | None = 8 * 1024**3
     max_duration_ms: int | None = 7_200_000
     format_selector: str = "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*[height<=1080]+ba/b[height<=1080]/b"
+    format_max_height: int = 1080
     merge_output_format: str = "mp4"
     subtitle_langs: tuple[str, ...] = ("zh-Hans", "zh-CN", "zh", "en")
     subtitle_formats: tuple[str, ...] = ("vtt", "srt", "ass")
@@ -128,6 +152,8 @@ class DownloadConfig:
     write_info_json: bool = True
     quiet: bool = True
     force: bool = False
+    verify_quality: bool = False
+    disk_reserve_bytes: int = 0
 
     def validate(self) -> None:
         if self.max_retries < 0:
@@ -171,14 +197,15 @@ class DownloadConfig:
             "max_file_bytes": getattr(limits, "max_file_bytes", None),
             "max_duration_ms": getattr(limits, "max_duration_ms", None),
         }
-        # 下载源分辨率上限（默认 720p）：分析链路真实需求只有关键帧 720 短边
+        # 下载源短边上限默认 1080；高清证据帧和原像素裁图保留细节。
         # 与视觉模型 448px，1080p 源只是白付两三倍下载时间。
         max_h = getattr(download, "format_max_height", None)
         if max_h:
             h = max(144, int(max_h))
+            kwargs["format_max_height"] = h
             kwargs["format_selector"] = (
-                f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/"
-                f"bv*[height<={h}]+ba/b[height<={h}]/b"
+                f"bv*[height<={h}][ext=mp4]+ba[ext=m4a]/b[height<={h}][ext=mp4]/"
+                f"bv*[height<={h}]+ba/b[height<={h}]"
             )
         for src, dst in (
             ("max_retries", "max_retries"),
@@ -471,6 +498,16 @@ class MediaDownloader:
             if candidate.stat().st_size <= 0:
                 continue
             meta = self._read_info(info_json)
+            if self.config.verify_quality:
+                actual = probe_media(candidate)
+                proof = self._read_info(target_dir / 'source.quality.json')
+                short = min(actual.display_width, actual.display_height)
+                proven = (proof.get('requested_short_side') == self.config.format_max_height and
+                          proof.get('actual_short_side') == short and proof.get('source_url') == source.url)
+                if not proven or (short < self.config.format_max_height and proof.get('best_available_short_side', 0) > short):
+                    self._refresh_download = True
+                    logger.info('缓存缺少本轮清晰度依据或低于可用档位，将重新获取')
+                    return None
             subtitles = tuple(
                 p
                 for p in target_dir.glob("source.*")
@@ -519,12 +556,12 @@ class MediaDownloader:
         hooks = (
             [self._hook(source.video_id, attempt, progress)]
             if progress is not None
-            else []
+            else [self._hook(source.video_id, attempt, None)]
         )
 
         options: dict[str, Any] = {
             "outtmpl": {"default": outtmpl},
-            "format": cfg.format_selector,
+            "format": quality_selector(cfg.format_max_height),
             "merge_output_format": cfg.merge_output_format,
             "noplaylist": True,
             "quiet": cfg.quiet,
@@ -535,7 +572,7 @@ class MediaDownloader:
             "fragment_retries": cfg.retries_per_fragment,
             "concurrent_fragment_downloads": cfg.concurrent_fragments,
             "continuedl": cfg.resume,
-            "overwrites": False,
+            "overwrites": bool(getattr(self, "_refresh_download", False)),
             "progress_hooks": hooks,
             "postprocessor_hooks": hooks,
             "writethumbnail": False,
@@ -555,7 +592,7 @@ class MediaDownloader:
             options["ffmpeg_location"] = ffmpeg
         else:
             # 无 ffmpeg 时不能用需要合并的格式选择器
-            options["format"] = "b[ext=mp4]/b"
+            options["format"] = quality_selector(cfg.format_max_height, merged=True)
             options["merge_output_format"] = None
         if cfg.cookie_file is not None and Path(cfg.cookie_file).is_file():
             options["cookiefile"] = str(cfg.cookie_file)
@@ -618,11 +655,21 @@ class MediaDownloader:
             self.config.max_file_bytes
             and path.stat().st_size > self.config.max_file_bytes
         ):
+            oversized = path.stat().st_size
             path.unlink(missing_ok=True)
             raise DownloadError(
-                f"下载产物 {path.stat().st_size / 1024**3:.2f} GB 超过上限，已删除"
+                f"下载产物 {oversized / 1024**3:.2f} GB 超过上限，已删除"
             )
 
+        if self.config.verify_quality:
+            actual = probe_media(path)
+            sizes = [min(f.get('width') or 0, f.get('height') or 0) for f in info.get('formats', [])
+                     if f.get('vcodec') != 'none' and min(f.get('width') or 0, f.get('height') or 0) <= self.config.format_max_height]
+            proof = {'requested_short_side': self.config.format_max_height,
+                     'actual_short_side': min(actual.display_width, actual.display_height),
+                     'best_available_short_side': max(sizes, default=min(actual.display_width, actual.display_height)),
+                     'source_url': source.url, 'format_id': info.get('format_id', '')}
+            (target_dir/'source.quality.json').write_text(json.dumps(proof, ensure_ascii=False),encoding='utf-8')
         subtitles = self._collect_subtitles(target_dir)
         info_json = target_dir / "source.info.json"
         warnings: list[str] = []
@@ -694,6 +741,12 @@ class MediaDownloader:
         self, video_id: str, attempt: int, progress: ProgressCallback | None
     ) -> Callable[[Mapping[str, Any]], None]:
         def _inner(payload: Mapping[str, Any]) -> None:
+            downloaded = int(payload.get('downloaded_bytes') or 0)
+            if self.config.max_file_bytes and downloaded > self.config.max_file_bytes:
+                raise DownloadError('下载超过文件大小上限，停止写入')
+            if self.config.disk_reserve_bytes:
+                from backend.analysis.runs import disk_check
+                disk_check(self.config.videos_dir, self.config.disk_reserve_bytes)
             if progress is None:
                 return
             status = str(payload.get("status") or "")

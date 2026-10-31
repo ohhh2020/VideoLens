@@ -471,7 +471,7 @@ check(
     all("点赞" not in s.text for s in tr_h.segments),
     str([s.text for s in tr_h.segments]),
 )
-check("重复行被丢弃", len(tr_h.segments) == 1, str([s.text for s in tr_h.segments]))
+check("不同时间的相同原文保留溯源", len(tr_h.segments) == 2, str([s.text for s in tr_h.segments]))
 check("保留正常文本", tr_h.segments[0].text == "真正的正文内容", tr_h.segments[0].text)
 
 print("\n  -- 下载器路径绝对化 --")

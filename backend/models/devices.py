@@ -45,6 +45,7 @@ def effective_settings(config, capabilities):
             config.embedding.image_device or config.models.device
         ),
         "ui.report_mode": config.ui.report_mode,
+        "ui.theme_mode": config.ui.theme_mode,
     }
 
 

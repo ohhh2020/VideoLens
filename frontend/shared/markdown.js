@@ -34,11 +34,11 @@
       const walker=scope.document.createTreeWalker(box,scope.NodeFilter.SHOW_TEXT),nodes=[];
       while(walker.nextNode()){
         const node=walker.currentNode;
-        if(!node.parentElement.closest("code,pre,a")&&/\[\d{1,3}\]/.test(node.textContent))nodes.push(node);
+        if(!node.parentElement.closest("code,pre,a")&&/\[\d{1,6}\]/.test(node.textContent))nodes.push(node);
       }
       for(const node of nodes){
         const fragment=scope.document.createDocumentFragment();let from=0;
-        for(const match of node.textContent.matchAll(/\[(\d{1,3})\]/g)){
+        for(const match of node.textContent.matchAll(/\[(\d{1,6})\]/g)){
           const ref=byIndex.get(Number(match[1]));if(!ref)continue;
           fragment.append(node.textContent.slice(from,match.index));
           const cite=scope.document.createElement("button");cite.type="button";cite.className="cite";cite.dataset.n=String(ref.index);

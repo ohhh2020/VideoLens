@@ -458,6 +458,10 @@ class EmbeddingService:
         self._normalize = bool(normalize)
         self._max_text_chars = max(1, int(max_text_chars))
         self._degraded_reason = ""
+        from backend.models.batching import AdaptiveBatch
+        self._text_batches = AdaptiveBatch()
+        self._image_batches = AdaptiveBatch()
+        self._cross_batches = AdaptiveBatch()
         self._text_lock = threading.Lock()
         self._image_lock = threading.Lock()
 
@@ -472,7 +476,7 @@ class EmbeddingService:
         text = BgeM3TextEmbedder(
             manager.ensure_model(e.text_model),
             device=e.text_device or cfg.models.device,
-            batch_size=min(e.batch_size, e.gpu_batch_size)
+            batch_size=cfg.integrity.gpu_batch_max
             if detect_device(e.text_device or cfg.models.device).startswith("cuda")
             else e.batch_size,
             max_length=e.max_text_chars,
@@ -482,19 +486,22 @@ class EmbeddingService:
         image = SigLip2ImageEmbedder(
             manager.ensure_model(e.image_model),
             device=e.image_device or cfg.models.device,
-            batch_size=min(e.batch_size, e.gpu_batch_size)
+            batch_size=cfg.integrity.gpu_batch_max
             if detect_device(e.image_device or cfg.models.device).startswith("cuda")
             else e.batch_size,
             name=e.image_model,
             dim=e.image_dim,
         )
-        return cls(
+        service = cls(
             text,
             image,
             batch_size=e.batch_size,
             normalize=e.normalize,
             max_text_chars=e.max_text_chars,
         )
+        for controller in (service._text_batches, service._image_batches, service._cross_batches):
+            controller.maximum = cfg.integrity.gpu_batch_max
+        return service
 
     # -- 属性 --
 
@@ -534,13 +541,15 @@ class EmbeddingService:
 
     # -- 编码 --
 
-    def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
+    def embed_texts(self, texts: Sequence[str], *, max_batch=None) -> list[list[float]]:
         """批量文本编码。空输入返回 ``[]``，空字符串返回零向量。"""
         items = [self._truncate(t) for t in texts]
         if not items:
             return []
         with self._text_lock, gpu_slot(getattr(self._text, "device", "cpu")):
-            vectors = self._text.embed_texts(items)
+            if max_batch is not None:
+                self._text_batches.maximum = max_batch
+            vectors = self._text_batches.run(items, self._text.embed_texts, getattr(self._text, "device", "cpu"), lengths=[len(t) for t in items])
         if len(vectors) != len(items):
             raise EmbeddingError(
                 f"文本编码器返回 {len(vectors)} 条向量，输入 {len(items)} 条"
@@ -553,13 +562,15 @@ class EmbeddingService:
         vectors = self.embed_texts([text])
         return vectors[0]
 
-    def embed_images(self, images: Sequence[str | Path | Any]) -> list[list[float]]:
+    def embed_images(self, images: Sequence[str | Path | Any], *, max_batch=None) -> list[list[float]]:
         """批量图像编码（路径或 PIL 对象）。"""
         items = list(images)
         if not items:
             return []
         with self._image_lock, gpu_slot(getattr(self._image, "device", "cpu")):
-            vectors = self._image.embed_images(items)
+            if max_batch is not None:
+                self._image_batches.maximum = max_batch
+            vectors = self._image_batches.run(items, self._image.embed_images, getattr(self._image, "device", "cpu"))
         if len(vectors) != len(items):
             raise EmbeddingError(
                 f"图像编码器返回 {len(vectors)} 条向量，输入 {len(items)} 张"

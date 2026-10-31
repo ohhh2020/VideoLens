@@ -134,6 +134,9 @@ class SegmentationStages:
         # D3 高运动降档：场景密度高的视频（体育/比赛），把相邻场景合并到
         # >= high_motion_scene_span_ms 再抽帧、每场景只留 1 帧 —— 静帧本来就
         # 区分不出两次进攻，多抽只是烧钱烧时间。
+        if getattr(self, "_analysis_run", None) is not None:
+            from backend.analysis.sampling import extract
+            return extract(self, local_path, video_id, clips, report, opts), scenes
         detector = self._scene
         eff_scenes = scenes
         if high_motion and scenes:
@@ -177,7 +180,14 @@ class SegmentationStages:
     ):
         # 视觉理解（描述）：segments / frames 按 vl.video_mode 与高运动画像分派
         payloads: list[dict[str, Any]] = []
-        if self._vl is not None and not opts.skip_vision:
+        if getattr(self, "_analysis_run", None) is not None and not opts.skip_vision:
+            from backend.analysis.fast import enabled
+            if enabled(self):
+                from backend.analysis.fast import describe
+            else:
+                from backend.analysis.vision import describe
+            payloads = describe(self, local_path, video_id, keyframes, scenes, report, progress=opts.progress)
+        elif self._vl is not None and not opts.skip_vision:
             payloads = self._describe_visual(
                 local_path, keyframes, report, scenes, high_motion
             )

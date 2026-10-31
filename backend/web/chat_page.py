@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
+from urllib.parse import urlencode
 
 from backend.pipeline.chat_sessions import get_chat_store
 from backend.storage.repository import StorageError
@@ -16,9 +17,6 @@ from backend.storage.repository import StorageError
 logger = logging.getLogger("zhiying.api.chat")
 
 __all__ = ["create_chat_router"]
-
-_STATIC_DIR = Path(__file__).resolve().parents[2] / "frontend/chat"
-
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -43,11 +41,8 @@ def create_chat_router(cfg: Any = None) -> APIRouter:
 
     # -- 页面 --------------------------------------------------------------- #
     @router.get("/chat", include_in_schema=False)
-    def chat_page() -> FileResponse:
-        index = _STATIC_DIR / "index.html"
-        if not index.is_file():
-            raise HTTPException(status_code=404, detail="chat 页面文件缺失")
-        return FileResponse(index, media_type="text/html; charset=utf-8")
+    def chat_page(video_id: str = ''):
+        return RedirectResponse('/ui' + ('?' + urlencode({'video_id': video_id}) if video_id else ''))
 
     # -- 会话（SQLite 持久化 + 内存多轮前缀）-------------------------------- #
     def _repo(request: Request) -> Any:

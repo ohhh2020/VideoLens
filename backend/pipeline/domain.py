@@ -132,6 +132,7 @@ class AnalyzeOptions:
     #: 外部任务号（backend.web.jobs.JobStore 发的 ``t<uuid>``）。传入时 ``_start_task``
     #: 用它写 SQLite tasks 表，内存进度流与持久化恢复记录共用同一个 ID。
     task_id: str = ""
+    policy_snapshot: dict | None = None
 
     def validate(self) -> None:
         if self.max_keyframes is not None and self.max_keyframes < 1:
@@ -174,6 +175,8 @@ class Citation:
     time_range: str
     keyframe_paths: tuple[str, ...] = ()
     text: str = ""
+    evidence_id: str = ""
+    kind: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -185,6 +188,8 @@ class Citation:
             "time_range": self.time_range,
             "keyframe_paths": list(self.keyframe_paths),
             "text": self.text,
+            "evidence_id": self.evidence_id,
+            "kind": self.kind,
         }
 
 
@@ -263,6 +268,8 @@ class AskResult:
     candidates: int = 0
     #: 本轮归属的会话（/chat 页每段对话一个 id；空=未分组的历史）
     session_id: str = ""
+    usage: dict[str, Any] = field(default_factory=dict)
+    truncated: bool = False
 
     @property
     def ok(self) -> bool:
@@ -281,6 +288,8 @@ class AskResult:
             "context_chars": self.context_chars,
             "candidates": self.candidates,
             "session_id": self.session_id,
+            "usage": dict(self.usage),
+            "truncated": self.truncated,
         }
 
 
@@ -288,7 +297,7 @@ class AskResult:
 # 引用解析
 # =============================================================================
 
-_CITE_RE: Final[re.Pattern[str]] = re.compile(r"\[(\d{1,3})\]")
+_CITE_RE: Final[re.Pattern[str]] = re.compile(r"\[(\d{1,6})\]")
 
 
 def extract_citations(answer: str, refs: Sequence[dict[str, Any]]) -> list[Citation]:
@@ -326,6 +335,8 @@ def extract_citations(answer: str, refs: Sequence[dict[str, Any]]) -> list[Citat
                 time_range=str(raw.get("time_range", "")),
                 keyframe_paths=tuple(raw.get("keyframe_paths", ()) or ()),
                 text=str(raw.get("text", "") or ""),
+                evidence_id=str(raw.get("evidence_id", "") or ""),
+                kind=str(raw.get("kind", "") or ""),
             )
         )
     return out

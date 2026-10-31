@@ -5,8 +5,8 @@
 .markdown-body h1{font-size:1.6em}.markdown-body h2{font-size:1.35em}.markdown-body h3{font-size:1.15em}
 .markdown-body p{margin:.65em 0}.markdown-body ul,.markdown-body ol{padding-left:1.7em;margin:.6em 0}
 .markdown-body li+li{margin-top:.25em}.markdown-body strong{font-weight:700}
-.markdown-body pre{white-space:pre;overflow:auto;padding:12px 14px;background:#0d111b;border:1px solid var(--border);border-radius:8px}
-.markdown-body code{font: .92em/1.6 Consolas,monospace;background:#0d111b;border-radius:4px;padding:.1em .3em}
+.markdown-body pre{white-space:pre;overflow:auto;padding:12px 14px;background:var(--code-bg,var(--panel2));border:1px solid var(--border);border-radius:8px}
+.markdown-body code{font: .92em/1.6 Consolas,monospace;background:var(--code-bg,var(--panel2));border-radius:4px;padding:.1em .3em}
 .markdown-body pre code{background:transparent;padding:0}
 .markdown-body blockquote{margin:.8em 0;padding:.2em 1em;border-left:3px solid var(--accent);color:var(--muted)}
 .markdown-body table{display:block;overflow-x:auto;width:max-content;max-width:100%;border-collapse:collapse;margin:1em 0}

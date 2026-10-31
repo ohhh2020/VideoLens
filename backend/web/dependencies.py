@@ -53,6 +53,12 @@ _TERMINAL_JOB_STATUS: Final[frozenset[str]] = TERMINAL_STATUS
 _ORCH: Orchestrator | None = None
 
 
+def require_linked_delete_ui(request: Request) -> None:
+    """旧页面的确认框仍声称保留视频，先阻止其删除并要求加载新提示。"""
+    if request.headers.get('sec-fetch-mode') and request.headers.get('x-videolens-linked-delete') != '1':
+        raise HTTPException(409, '删除规则已更新为视频和全部关联会话一起删除，请刷新页面后重新确认')
+
+
 _ORCH_LOCK = threading.Lock()
 
 
@@ -125,12 +131,21 @@ def _as_dict(obj: Any) -> dict[str, Any]:
     raise TypeError(f"无法序列化: {type(obj)!r}")
 
 
-def _video_out(record: Any) -> VideoOut:
+def _video_out(record: Any, conversation=None) -> VideoOut:
     raw = _as_dict(record)
+    from pathlib import Path
+    conversation=conversation or {}
+    title=conversation.get('title','') if conversation.get('title_source')!='pending' else ''
+    local=str(raw.get('local_path') or '')
+    if local and raw.get('source_kind')=='local':
+        local=str(Path(local).resolve())
     return VideoOut(
         video_id=str(raw.get("video_id", "")),
         display_name=str(raw.get("display_name", "")),
-        title=str(raw.get("title", "")),
+        title=title or str(raw.get("title", "")),
+        conversation_id=conversation.get('id',''),
+        conversation_title=title,
+        local_path=local,
         source_kind=str(raw.get("source_kind", "")),
         source_url=str(raw.get("source_url", "")),
         duration_ms=int(raw.get("duration_ms", 0) or 0),
@@ -244,6 +259,8 @@ def _subtitle_filename(title: str, video_id: str, fmt: str) -> str:
 def _answer_out(result: AskResult) -> AnswerOut:
     return AnswerOut(
         question=result.question,
+        usage=result.usage,
+        truncated=result.truncated,
         answer=result.answer,
         video_id=result.video_id,
         refs=[CitationOut(**c.to_dict()) for c in result.refs],

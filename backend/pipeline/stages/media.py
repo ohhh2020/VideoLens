@@ -70,7 +70,7 @@ class MediaStages:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("清空旧产物失败: %s", exc)
                 paths = []
-            if self._vectors is not None:
+            if self._vectors is not None and not getattr(self, "_isolated_run", False):
                 try:
                     self._vectors.delete_video(video_id)
                 except Exception as exc:  # noqa: BLE001
@@ -155,6 +155,7 @@ class MediaStages:
                 subtitles=self._find_subtitles(local_path),
                 duration_ms=int(getattr(probe_info, "duration_ms", 0) or 0),
                 allow_subtitle=self._cfg.asr.fallback_to_subtitle,
+                **({"max_batch": self._cfg.integrity.asr_batch_max} if getattr(self, "_analysis_run", None) is not None else {}),
             )
         if result.degraded and result.source == "empty":
             raise PipelineError("Whisper 失败：" + "；".join(result.warnings))

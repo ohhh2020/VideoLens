@@ -231,14 +231,18 @@ def _image_to_data_uri(path: Path, *, max_side: int = 1280, quality: int = 88) -
                     Image.Resampling.LANCZOS,
                 )
             buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=quality, optimize=True)
+            if path.suffix.lower() == ".png" and max_side == 0:
+                img.save(buf, format="PNG")
+            else:
+                img.save(buf, format="JPEG", quality=quality, optimize=True)
     except VlError:
         raise
     except Exception as exc:  # noqa: BLE001
         raise VlError(f"读取关键帧失败({path}): {exc}") from exc
 
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/jpeg;base64,{b64}"
+    mime = "png" if path.suffix.lower() == ".png" and max_side == 0 else "jpeg"
+    return f"data:image/{mime};base64,{b64}"
 
 
 # =============================================================================
@@ -249,6 +253,17 @@ def _image_to_data_uri(path: Path, *, max_side: int = 1280, quality: int = 88) -
 
 
 
+
+
+class VisionText(str):
+    def __new__(cls, text, data=None):
+        obj = super().__new__(cls, text)
+        data = data or {}
+        obj.finish_reason = str((data.get('choices') or [{}])[0].get('finish_reason') or '')
+        usage = data.get('usage') or {}
+        obj.prompt_tokens = int(usage.get('prompt_tokens') or 0)
+        obj.completion_tokens = int(usage.get('completion_tokens') or 0)
+        return obj
 
 
 def _extract_content(response: Any) -> str:
@@ -377,6 +392,7 @@ class OpenAiVisionRunner:
         stamps: Sequence[int] | None = None,
         max_tokens: int = 384,
         temperature: float = 0.3,
+        native: bool = False,
     ) -> str:
         if not self.available():
             raise VlError("云端视觉后端未配置 base_url 或 model")
@@ -392,7 +408,7 @@ class OpenAiVisionRunner:
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": _image_to_data_uri(path, max_side=self.max_image_side)
+                        "url": _image_to_data_uri(path, max_side=0 if native else self.max_image_side, quality=92)
                     },
                 }
             )
@@ -402,6 +418,7 @@ class OpenAiVisionRunner:
             "model": self.model,
             "enable_thinking": False,
             "messages": [{"role": "user", "content": content}],
+            **({"response_format": {"type": "json_object"}} if native else {}),
             "max_tokens": max(1, int(max_tokens)),
             "temperature": float(temperature),
             "stream": False,
@@ -412,7 +429,9 @@ class OpenAiVisionRunner:
         )
 
         last_error = ""
-        for attempt in range(self.max_retries + 1):
+        from backend.analysis.cloud import MANAGED, http_error
+        retries = 0 if MANAGED.get() else self.max_retries
+        for attempt in range(retries + 1):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
                     raw = response.read()
@@ -421,6 +440,8 @@ class OpenAiVisionRunner:
             except urllib.error.HTTPError as exc:
                 detail = _read_error_body(exc)
                 last_error = f"HTTP {exc.code}: {detail}"
+                if MANAGED.get() and exc.code not in {401, 403, 404}:
+                    raise http_error(VlError(last_error), exc) from exc
                 # 4xx（除 429 限流）重试没有意义，直接抛
                 if exc.code == 404:
                     self._model_error = f"视觉模型不存在 HTTP 404：{self.model}；请从当前服务的模型清单选择可用模型并重启服务"
@@ -440,7 +461,7 @@ class OpenAiVisionRunner:
                 raise
             except Exception as exc:  # noqa: BLE001
                 last_error = f"{type(exc).__name__}: {exc}"
-            if attempt < self.max_retries:
+            if attempt < retries:
                 delay = min(4.0, 0.8 * (2**attempt))
                 logger.warning("云端视觉第 %d 次失败(%s)，%.1fs 后重试",
                                attempt + 1, last_error, delay)
@@ -462,7 +483,7 @@ class OpenAiVisionRunner:
             }
         if not text:
             raise VlError("云端视觉返回空内容")
-        return text
+        return VisionText(text, data)
 
     def close(self) -> None:
         """无连接需要释放（每次请求都是新的 urllib 连接池条目）。"""
@@ -528,6 +549,7 @@ class QwenVideoRunner:
         self.api_key = api_key or ""
         self.timeout_s = float(timeout_s)
         self.max_retries = max(0, int(max_retries))
+        self._encoded_local = threading.local()
         self.segment_max_s = max(5.0, float(segment_max_s))
         self.max_segment_bytes = int(max_segment_mb * 1024 * 1024)
         self.name = name or f"cloud-video:{self.model}"
@@ -553,32 +575,23 @@ class QwenVideoRunner:
     def encode_segment(self, video_path: Path, start_ms: int, end_ms: int, dest: Path) -> Path:
         """剪出 ``[start_ms, end_ms)`` 的 mp4 小段，控制在体积上限内。
 
-        先试流复制（``-c copy``，秒级、关键帧对齐）；超体积再降为
-        480p/CRF28 重编码。音频丢弃 —— 视频理解只用画面，音轨另有 ASR。
+        使用精确裁剪重编码，并用FFprobe验证输出时长。音轨另由ASR处理。
         """
         import subprocess  # noqa: PLC0415
 
         start = max(0.0, int(start_ms) / 1000.0)
-        duration = max(0.5, (int(end_ms) - int(start_ms)) / 1000.0)
-        duration = min(duration, self.segment_max_s + 5.0)
+        duration = (int(end_ms) - int(start_ms)) / 1000.0
+        if duration <= 0:
+            raise VlError("视频段起止时间无效")
+        if duration > self.segment_max_s + 0.001:
+            raise VlError("视频段超过单窗上限，必须先按时间拆分")
         dest.parent.mkdir(parents=True, exist_ok=True)
         src = str(video_path)
-        cmd_fast = [
-            self._ffmpeg(), "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
-            "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", src,
-            "-c", "copy", "-an", "-avoid_negative_ts", "make_zero",
-            str(dest),
-        ]
-        proc = subprocess.run(  # noqa: S603 - 参数由本模块拼装
-            cmd_fast, capture_output=True, timeout=60, check=False
-        )
-        if proc.returncode == 0 and dest.is_file() and dest.stat().st_size <= self.max_segment_bytes:
-            return dest
         cmd_reencode = [
             self._ffmpeg(), "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
             "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", src,
-            "-vf", "scale='if(gt(iw,ih),-2,480)':'if(gt(iw,ih),480,-2)'",
-            "-c:v", "libx264", "-crf", "28", "-preset", "veryfast", "-an",
+            "-vf", "scale='if(gt(iw,ih),min(1280,iw),-2)':'if(gt(iw,ih),-2,min(1280,ih))'",
+            "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-an",
             str(dest),
         ]
         proc = subprocess.run(  # noqa: S603
@@ -592,6 +605,11 @@ class QwenVideoRunner:
                 f"视频段 {dest.name} 重编码后仍 {dest.stat().st_size // 1024}KB"
                 f"（上限 {self.max_segment_bytes // 1024}KB），请调小 vl.video_segment_max_s"
             )
+        from backend.media.ffmpeg_utils import probe_media
+        actual = probe_media(dest)
+        if not actual.has_video or abs(actual.duration_ms - duration * 1000) > 120:
+            raise VlError('视频段实际编码范围与请求不符，禁止生成误导引用')
+        self._encoded_local.duration_ms = actual.duration_ms
         return dest
 
     # -- 推理 ------------------------------------------------------------ #
@@ -608,6 +626,7 @@ class QwenVideoRunner:
         with tempfile.TemporaryDirectory(prefix="zhiying-seg-") as tmp:
             seg = Path(tmp) / "segment.mp4"
             self.encode_segment(video_path, start_ms, end_ms, seg)
+            encoded_duration = getattr(self._encoded_local, "duration_ms", end_ms - start_ms)
             data_uri = "data:video/mp4;base64," + _b64.b64encode(
                 seg.read_bytes()
             ).decode("ascii")
@@ -638,7 +657,9 @@ class QwenVideoRunner:
             self.endpoint, data=payload, headers=headers, method="POST"
         )
         last_error = ""
-        for attempt in range(self.max_retries + 1):
+        from backend.analysis.cloud import MANAGED, http_error
+        retries = 0 if MANAGED.get() else self.max_retries
+        for attempt in range(retries + 1):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
                     raw = response.read()
@@ -646,10 +667,16 @@ class QwenVideoRunner:
                 text = _extract_content(data)
                 if not text:
                     raise VlError("云端视频段返回空内容")
-                return text
+                result = VisionText(text, data)
+                result.actual_start_ms = start_ms
+                result.actual_end_ms = start_ms + encoded_duration
+                result.encoded_duration_ms = encoded_duration
+                return result
             except urllib.error.HTTPError as exc:
                 detail = _read_error_body(exc)
                 last_error = f"HTTP {exc.code}: {detail}"
+                if MANAGED.get() and exc.code not in {401, 403, 404}:
+                    raise http_error(VlError(last_error), exc) from exc
                 if 400 <= exc.code < 500 and exc.code != 429:
                     if exc.code in {401, 403}:
                         self._auth_error = f"云端视频段认证失败 HTTP {exc.code}，请重新填写完整 API Key 并重启服务"
@@ -657,7 +684,7 @@ class QwenVideoRunner:
                     break
             except Exception as exc:  # noqa: BLE001
                 last_error = f"{type(exc).__name__}: {exc}"
-            if attempt < self.max_retries:
+            if attempt < retries:
                 time.sleep(min(4.0, 0.8 * (2 ** attempt)))
         raise VlError(f"云端视频段调用失败({self.model}): {last_error}")
 

@@ -72,8 +72,8 @@ check(
     "to_dict 无运行时分部", "root_dir" not in payload and "source_file" not in payload
 )
 check(
-    "19 个顶层段（含网页显示与记忆配置）",
-    len(payload) == 19 and "ui" in payload and "memory" in payload and "gradio" not in payload,
+    "20 个顶层段（含网页显示与记忆配置）",
+    len(payload) == 20 and "ui" in payload and "memory" in payload and "gradio" not in payload,
     f"{sorted(payload)}",
 )
 try:
