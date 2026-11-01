@@ -160,11 +160,12 @@ def execute(parent, source, options):
 
 def _execute(parent, source, options):
     """共享已加载的三个本地模型，使用独立仓储/目录执行新版本任务。"""
-    from backend.pipeline.domain import _video_lock, AnalysisReport
+    from backend.pipeline.domain import _video_lock, AnalysisReport, Stage, StageReport
     from backend.pipeline.factory import _build_scene, _build_chunker, _build_context, _build_downloader, _build_vl, _build_llm
     from backend.pipeline.orchestrator import Orchestrator
     from backend.storage.repository import SqliteRepository
 
+    started = time.monotonic()
     task_policy = options.policy_snapshot or snapshot(parent._cfg)
     cfg = restore(parent._cfg, task_policy)
     from backend.media.parser import ParseOptions, parse_source
@@ -181,6 +182,9 @@ def _execute(parent, source, options):
                     if field.name in data and field.name != 'stages':
                         setattr(result, field.name, data[field.name])
                 result.profile.setdefault('analysis_version', 'legacy')
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                parent._log_timings(AnalysisReport(video_id=vid, status='ready', elapsed_ms=elapsed_ms,
+                    stages=[StageReport(stage=Stage.DONE, skipped=True, elapsed_ms=elapsed_ms)]))
                 return result
         media = parent._parse_source(source, options)
         key = options.task_id or 'direct-' + uuid4().hex
@@ -210,7 +214,7 @@ def _execute(parent, source, options):
         staged = SqliteRepository.from_config(staged_cfg)
         clone = Orchestrator(repository=staged, vectors=parent._vectors,
                              embedder=parent._embedder, asr=parent._asr, llm=_build_llm(staged_cfg, None),
-                             scene_detector=_build_scene(staged_cfg), chunker=_build_chunker(staged_cfg),
+                             scene_detector=None if task_policy.get('_analysis_strategy') == 'fast-v4' else _build_scene(staged_cfg), chunker=_build_chunker(staged_cfg),
                              context_builder=_build_context(staged_cfg), downloader=_build_downloader(staged_cfg),
                              vl=_build_vl(staged_cfg, None), config=staged_cfg)
         clone._downloader.config = replace(clone._downloader.config, verify_quality=True, disk_reserve_bytes=cfg.integrity.disk_reserve_bytes)

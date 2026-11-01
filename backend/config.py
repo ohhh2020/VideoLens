@@ -414,7 +414,7 @@ class VlSection:
     # 云端没这个限制（2B 模型的毛病），放宽到 8；本地仍锁 1..4
     cloud_sequence_frames: int = 8
     cloud_workers: int = 8
-    # ---- 视频段理解（云端 qwen-vl 直接吃短视频段，见 docs/演进计划）----
+    # ---- 旧版视频段理解配置，历史策略见 docs/更新日志/历史完整性策略.md ----
     #: auto=按场景密度分派（讲解→帧，运动→段）；frames=只用抽帧；segments=只用分段
     video_mode: str = "auto"
     #: 单段时长上限（秒）：超出按此再剪；也决定上传体积（480p 重编码后约 1~5MB）

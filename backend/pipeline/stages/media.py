@@ -171,12 +171,11 @@ class MediaStages:
 
         order = {suffix: i for i, suffix in enumerate(self._cfg.asr.subtitle_priority)}
         try:
-            candidates = [
-                p
-                for p in local_path.parent.iterdir()
-                if p.is_file()
-                and p.suffix.lstrip(".").lower() in SUPPORTED_SUBTITLE_SUFFIXES
-            ]
+            original = local_path.resolve()
+            candidates = [p for base in {local_path, original} for p in base.parent.iterdir()
+                if p.is_file() and p.suffix.lstrip('.').lower() in SUPPORTED_SUBTITLE_SUFFIXES
+                and (p.stem == base.stem or p.stem.startswith(base.stem + '.'))]
+            candidates = list(dict.fromkeys(candidates))
         except OSError:
             return []
         candidates.sort(

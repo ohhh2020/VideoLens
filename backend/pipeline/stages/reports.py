@@ -411,6 +411,12 @@ class ReportStages:
         if opts.skip_summary:
             return "", "skipped"
         if getattr(self, "_analysis_run", None) is not None:
+            from backend.analysis.optimized import enabled as optimized
+            if optimized(self):
+                from backend.analysis.packing import summarize
+                text = summarize(self._repo, video_id, title, self._llm, self._cfg.integrity, self._analysis_run,
+                    preference=lambda messages: self._preference_messages(messages, title, report=True))
+                return text, 'cloud'
             from backend.analysis.fast import enabled
             if enabled(self):
                 from backend.analysis.fast import summarize

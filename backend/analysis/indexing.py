@@ -22,6 +22,15 @@ def build_index(orch, video_id, clips, frames, report):
         start = time.monotonic()
         with orch._inference_slot('全量证据文本向量', report):
             vectors = orch._embedder.embed_texts(texts, max_batch=policy.gpu_batch_max)
+        # 可复用的BGE语义评分只消耗已有向量；报告线程不等待此项，也不新增推理。
+        import numpy as np
+        matrix = np.asarray(vectors, dtype='float32')
+        if matrix.ndim == 2 and len(matrix):
+            center = matrix.mean(axis=0)
+            norm = float(np.linalg.norm(center))
+            if norm:
+                scores = matrix @ (center / norm)
+                ledger.put('evidence_semantic_scores', {row['id']: round(float(score), 4) for row, score in zip(evidence, scores)})
         report.profile['text_encode_ms'] = int((time.monotonic()-start)*1000)
         written = store.upsert_clips(
             ids=[row['id'] for row in evidence], embeddings=vectors, documents=texts,

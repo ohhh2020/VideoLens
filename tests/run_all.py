@@ -35,6 +35,7 @@ ROOT = TESTS_DIR.parent
 
 #: (文件名, 分类, 说明) —— 顺序即执行顺序，从底层依赖向上。
 SUITES: tuple[tuple[str, str, str], ...] = (
+    ("test_optimized_analysis.py", "并行分析", "无镜头检测、复用解码、边产帧边识别、转写缓存与完整事实预算"),
     ("test_local_links.py", "本地视频", "真实软链接、原文件保护、本机选择器与视频库会话标题"),
     ("test_fast_analysis.py", "性能回退", "固定采样、整帧识别、单次报告与旧版快照兼容"),
     ("test_terminal.py", "终端", "Windows VT、MSYS PTY、普通管道与无ANSI输出"),

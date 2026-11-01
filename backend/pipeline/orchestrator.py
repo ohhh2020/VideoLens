@@ -150,6 +150,9 @@ class Orchestrator(
 
     def _analyze(self, source, options=None):
         opts = options or AnalyzeOptions()
+        from backend.analysis.optimized import enabled, analyze
+        if enabled(self):
+            return analyze(self, source, opts)
         opts.validate()
         started = time.monotonic()
         report = AnalysisReport(duration_ms=0)
@@ -589,6 +592,13 @@ class Orchestrator(
             item.stage == Stage.DONE and item.skipped for item in report.stages
         )
         rows = [f"分析耗时汇总 video={report.video_id or '?'} status={report.status}"]
+        parallel = report.profile.get('pipeline') == 'audio||decode->vision;summary||index'
+        if parallel and not cached:
+            rows.append("  并行流程：音频/转写 与 抽帧→视觉/OCR并行；文本总结 与 向量索引并行")
+            reused = report.profile.get('transcript_reused')
+            if reused:
+                rows.append("  转写复用：" + {'content-cache': '音频内容缓存', 'run-checkpoint': '本次运行检查点',
+                                             'matched-subtitle': '匹配字幕'}.get(reused, reused))
         if cached:
             rows.append(
                 "  本次复用已有分析结果，仅统计本次读取耗时，历史分析报告保持不变"
@@ -606,6 +616,9 @@ class Orchestrator(
             ("index_write_ms", "索引写入"),
         ):
             if not cached and key in report.profile:
+                if parallel:
+                    label = {'frame_extract_ms': '抽帧（含队列等待）',
+                             'cloud_vision_ms': '取帧＋视觉/OCR墙钟'}.get(key, label)
                 rows.append(f"  {label:<12} {report.profile[key] / 1000:8.3f}s")
         rows.append(
             f"  总耗时（实际经过） {report.elapsed_ms / 1000:.3f}s；并发阶段有重叠，各项不能相加当作总耗时"
@@ -978,6 +991,8 @@ class Orchestrator(
             if getattr(self, "_use_integrity", False):
                 from backend.analysis.runs import purge_versions
                 removed["analysis_versions"] = purge_versions(self, video_id)
+                from backend.analysis.transcripts import purge
+                removed['transcript_cache'] = purge(self, video_id)
             removed['uploads'] = purge_uploads(self._repo, self._cfg, uploads)
         except Exception as exc:  # noqa: BLE001
             removed["db_error"] = str(exc)
@@ -1184,7 +1199,8 @@ class Orchestrator(
         elif item.started_at:
             item.elapsed_ms = max(0, int((time.monotonic() - item.started_at) * 1000))
         logger.info(
-            "阶段完成 %s %.3fs %s",
+            "%s %s %.3fs %s",
+            "阶段完成" if item.ok else "阶段失败",
             _STAGE_LABEL[item.stage],
             item.elapsed_ms / 1000,
             message,

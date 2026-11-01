@@ -207,6 +207,23 @@ def _clean_text(text: str) -> str:
 
 
 def _image_to_data_uri(path: Path, *, max_side: int = 1280, quality: int = 88) -> str:
+    path = Path(path)
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        raise VlError(f'关键帧无法读取: {path}') from exc
+    return _cached_image_uri(str(path), stat.st_mtime_ns, stat.st_size, max_side, quality)
+
+
+from functools import lru_cache
+
+
+@lru_cache(maxsize=32)
+def _cached_image_uri(filename, modified, size, max_side, quality):
+    return _encode_image_uri(Path(filename), max_side=max_side, quality=quality)
+
+
+def _encode_image_uri(path: Path, *, max_side: int = 1280, quality: int = 88) -> str:
     """读图 → 必要时缩小 → 转 data URI。
 
     缩小是为了控制上下文长度：Qwen2-VL 的视觉 token 数随面积增长，
@@ -433,7 +450,8 @@ class OpenAiVisionRunner:
         retries = 0 if MANAGED.get() else self.max_retries
         for attempt in range(retries + 1):
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+                from backend.models.http_transport import open_request
+                with open_request(self, request, self.timeout_s) as response:
                     raw = response.read()
                 data = json.loads(raw.decode("utf-8"))
                 return self._parse(data)
@@ -486,8 +504,8 @@ class OpenAiVisionRunner:
         return VisionText(text, data)
 
     def close(self) -> None:
-        """无连接需要释放（每次请求都是新的 urllib 连接池条目）。"""
-        logger.debug("云端视觉后端无状态，close() 空操作")
+        from backend.models.http_transport import close_pool
+        close_pool(self)
 
 
 def _read_error_body(exc: urllib.error.HTTPError) -> str:
@@ -525,7 +543,7 @@ class QwenVideoRunner:
 
     与逐帧图片模式（:class:`OpenAiVisionRunner`）的本质差别不是省钱省时，
     是**语义**：两张静帧区分不出"一次进攻"和"另一次进攻"，连续画面才行。
-    设计取舍见 docs/演进计划：分段而非整段 —— 上传体积可控（480p 重编码
+    旧版设计见 docs/更新日志/历史完整性策略.md：分段而非整段 —— 上传体积可控（480p 重编码
     后 1~5MB）、段边界即场景边界（天然对齐引用时间戳）、单段失败只损一段。
 
     仅 DashScope 系（及任何接受 ``video_url`` 的 OpenAI 兼容端点）可用；

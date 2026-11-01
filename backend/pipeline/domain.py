@@ -126,6 +126,7 @@ class AnalyzeOptions:
     skip_vectors: bool = False
     force: bool = False
     resume: bool = True
+    reuse_transcript: bool = True
     max_keyframes: int | None = None
     title: str = ""
     progress: Callable[[str, float, str], None] | None = None

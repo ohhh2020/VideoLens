@@ -165,7 +165,7 @@ def build_orchestrator(
             vectors=vectors,
             embedder=embed,
             asr=asr,
-            scene_detector=_build_scene(cfg),
+            scene_detector=None,
             chunker=_build_chunker(cfg),
             vl=vl,
             llm=llm,

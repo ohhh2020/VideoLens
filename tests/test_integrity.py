@@ -191,11 +191,15 @@ class IntegrityTests(unittest.TestCase):
                 vid = parse_source(file, ParseOptions(do_probe=False)).video_id
                 repo.add_video(video_id=vid, status='ready')
                 repo.set_video_report(vid, {'video_id': vid, 'status': 'ready', 'summary': '既有报告', 'profile': {}})
+                timings = []
                 parent = SimpleNamespace(_cfg=cfg, _repo=repo, _require_cloud_ready=lambda: None,
+                    _log_timings=timings.append,
                     _parse_source=lambda *a: self.fail('旧报告复用不得重新探测或触发分析'))
                 report = execute(parent, str(file), AnalyzeOptions())
                 self.assertTrue(report.ok, report.errors)
                 self.assertEqual(report.summary, '既有报告')
+                self.assertEqual(len(timings), 1)
+                self.assertTrue(timings[0].stages[0].skipped)
                 self.assertEqual(repo._query_one('SELECT COUNT(*) FROM analysis_runs')[0], 0)
 
     def test_cloud_limit_retry_and_stream_metadata(self):

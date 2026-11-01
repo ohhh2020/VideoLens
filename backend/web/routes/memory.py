@@ -1,9 +1,9 @@
 """仅供本机网页使用的偏好记忆编辑工作流。"""
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 from backend.memory.store import MemoryError
 from backend.web.dependencies import _orchestrator
@@ -19,6 +19,11 @@ class MemoryOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: StrictBool
     auto_learn: StrictBool
+
+
+class MemoryDeleteMany(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ids: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(min_length=1, max_length=200)
 
 
 def create_router(cfg=None):
@@ -37,6 +42,8 @@ def create_router(cfg=None):
             raise HTTPException(422,str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(404,"记忆不存在或已被删除") from exc
+        except OSError as exc:
+            raise HTTPException(500,"记忆保存失败，原数据已保留，请检查运行目录写入权限与磁盘空间") from exc
 
     @router.get("/memory")
     def listing(request: Request):
@@ -46,6 +53,12 @@ def create_router(cfg=None):
     def add(request: Request, payload: MemoryInput):
         memory = service(request)
         return edit(lambda: memory.store.put(payload.text,payload.kind))
+
+    @router.post("/memory/items/delete-many")
+    def delete_many(request: Request, payload: MemoryDeleteMany):
+        memory = service(request)
+        removed = edit(lambda: memory.store.delete_many(payload.ids))
+        return {"deleted": True, "deleted_count": len(removed), "ids": removed}
 
     @router.put("/memory/items/{item_id}")
     def update(request: Request, item_id: str, payload: MemoryInput):

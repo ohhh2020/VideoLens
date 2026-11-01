@@ -15,6 +15,7 @@ def main():
     parser.add_argument('--source', required=True)
     parser.add_argument('--output', required=True)
     parser.add_argument('--port', type=int, default=8000)
+    parser.add_argument('--no-transcript-cache', action='store_true', help='强制执行ASR，防止转写缓存命中混入首次分析对照')
     args = parser.parse_args()
     base = f'http://127.0.0.1:{args.port}/internal'
     def api(path, payload=None):
@@ -31,7 +32,7 @@ def main():
     cid = conversation.get('conversation', conversation)['id']
     started, wall = time.monotonic(), time.time()
     accepted = api(f'/conversations/{cid}/messages', {'text':args.source,'request_id':'benchmark-'+uuid4().hex,
-                                                   'options':{'force':True}})
+                                                   'options':{'force':True,'reuse_transcript':not args.no_transcript_cache}})
     events, previous, last_print = [], None, 0
     while True:
         current = api(f'/conversations/{cid}')

@@ -188,6 +188,52 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(client.delete("/internal/memory/items/"+item["id"]).status_code,404)
             self.assertEqual(client.post("/internal/memory/items",json={"text":""}).status_code,422)
 
+    def test_batch_delete_is_atomic_and_blocks_relearning(self):
+        first = self.store.put("用户希望优先说明硬件需求。")
+        second = self.store.put("用户偏好精简的步骤说明。")
+        keep = self.store.put("用户希望电影分析关注剧情。")
+        before = self.store.snapshot()
+        raw = self.store.path.read_bytes()
+        with self.assertRaises(KeyError):
+            self.store.delete_many([first['id'], 'missing'])
+        self.assertEqual(self.store.path.read_bytes(), raw)
+        with patch.object(self.store, '_save', side_effect=OSError('磁盘写入失败')):
+            with self.assertRaises(OSError):
+                self.store.delete_many([first['id'], second['id']])
+        self.assertEqual(self.store.snapshot(), before)
+        self.assertEqual(self.store.path.read_bytes(), raw)
+        removed = self.store.delete_many([first['id'], second['id'], first['id']])
+        self.assertEqual(set(removed), {first['id'], second['id']})
+        after = self.store.snapshot()
+        self.assertEqual(after['revision'], before['revision'] + 1)
+        self.assertEqual([i['id'] for i in after['items']], [keep['id']])
+        from backend.memory.store import text_hash
+        self.assertTrue({text_hash(first['text']), text_hash(second['text'])} <= set(after['blocked_hashes']))
+        reloaded = MemoryStore(self.store.path, self.encoder, self.cfg.memory)
+        self.assertEqual([i['id'] for i in reloaded.snapshot()['items']], [keep['id']])
+
+    def test_batch_delete_http_validation_and_failure_keep_originals(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from backend.web.routes.memory import create_router
+        app = FastAPI(); app.state.orchestrator = SimpleNamespace(_memory=self.memory)
+        app.include_router(create_router(), prefix='/internal')
+        first = self.store.put('用户希望看到硬件对比。')
+        second = self.store.put('用户希望简洁说明操作。')
+        endpoint = '/internal/memory/items/delete-many'
+        with TestClient(app) as client:
+            for payload in ({'ids': []}, {'ids': [1]}, {'ids': ['']}, {'ids': [first['id']] * 201}):
+                self.assertEqual(client.post(endpoint, json=payload).status_code, 422)
+            self.assertEqual(client.post(endpoint, json={'ids': [first['id'], 'missing']}).status_code, 404)
+            self.assertEqual(len(self.store.snapshot()['items']), 2)
+            with patch.object(self.store, '_save', side_effect=OSError('写入失败')):
+                self.assertEqual(client.post(endpoint, json={'ids': [first['id']]}).status_code, 500)
+            self.assertEqual(len(self.store.snapshot()['items']), 2)
+            result = client.post(endpoint, json={'ids': [first['id'], second['id'], first['id']]})
+            self.assertEqual(result.status_code, 200, result.text)
+            self.assertEqual(result.json()['deleted_count'], 2)
+            self.assertEqual(self.store.snapshot()['items'], [])
+
 
 if __name__=="__main__":
     unittest.main(verbosity=2)

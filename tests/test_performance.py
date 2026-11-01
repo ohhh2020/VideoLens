@@ -327,6 +327,23 @@ class PerformanceTests(unittest.TestCase):
         self.assertIn("复用已有分析结果", logs.output[0])
         self.assertNotIn("BGE 文本编码", logs.output[0])
 
+    def test_versioned_result_cache_logs_only_current_read_time(self):
+        from backend.analysis.runs import _execute
+        saved = {'video_id': 'vcached', 'status': 'ready', 'elapsed_ms': 13000,
+                 'profile': {'text_encode_ms': 12000}, 'summary': '已保存报告'}
+        repo = Mock()
+        repo.find_video.return_value = SimpleNamespace(status='ready')
+        repo.get_video_report.return_value = saved
+        orch = Orchestrator(repository=repo, config=load_app_config(root=ROOT, ignore_user_settings=True))
+        with patch('backend.media.parser.parse_source', return_value=SimpleNamespace(video_id='vcached')):
+            with self.assertLogs('zhiying.pipeline', level='INFO') as logs:
+                result = _execute(orch, 'fixture', AnalyzeOptions())
+        self.assertEqual(result.elapsed_ms, 13000, '历史报告计时保持不变')
+        self.assertEqual(saved['elapsed_ms'], 13000)
+        self.assertIn('复用已有分析结果', logs.output[0])
+        self.assertNotIn('BGE 文本编码', logs.output[0])
+        self.assertNotIn('13.000s', logs.output[0], '本次复用日志不能冒用历史分析时间')
+
     def test_parallel_workers_join_before_error_cleanup(self):
         done = threading.Event()
 

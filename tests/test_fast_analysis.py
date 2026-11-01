@@ -25,11 +25,15 @@ class FastTests(unittest.TestCase):
     def test_snapshot_uses_fast_but_old_snapshot_keeps_old_execution(self):
         config = load_app_config()
         values = snapshot(config)
-        self.assertEqual(values['_analysis_strategy'], 'fast-v3')
+        self.assertEqual(values['_analysis_strategy'], 'fast-v4')
         restore(config, values)
         with tempfile.TemporaryDirectory() as directory:
             ledger = RunLedger(directory, 'strategy')
             orch = SimpleNamespace(_analysis_run=ledger)
+            ledger.put('policy', values)
+            from backend.analysis.optimized import enabled
+            self.assertTrue(enabled(orch))
+            values['_analysis_strategy'] = 'fast-v3'
             ledger.put('policy', values)
             self.assertTrue(fast.enabled(orch))
             values.pop('_analysis_strategy')

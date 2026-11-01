@@ -8,6 +8,7 @@
   let draftHint="";
   const $=selector=>document.querySelector(selector);
   const escape=value=>String(value||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const author=(title,assistant=true)=>'<div class="message-author">'+(assistant?'<img class="zhiying-avatar message-avatar" src="/assets/workbench/assets/zhiying-avatar.jpg" width="30" height="30" alt="" loading="lazy">':'')+'<span>'+escape(title)+'</span></div>';
   const uid=()=>scope.crypto?.randomUUID?.()||Date.now().toString(36)+Math.random().toString(36).slice(2);
   const stamp=ms=>{const s=Math.floor((ms||0)/1000);return [Math.floor(s/3600),Math.floor(s/60)%60,s%60].map(v=>String(v).padStart(2,"0")).join(":")};
   const detailed=()=>document.body.classList.contains("user-mode")===false;
@@ -24,14 +25,44 @@
     $("#messageInput").disabled=uploadBusy;
   }
   function reportText(report){return detailed()?report.summary||"（未生成总结）":VideoLensMarkdown.userReport(report.summary||"（未生成总结）")}
+  function fallbackCopy(text){
+    const focused=document.activeElement,selection=scope.getSelection();
+    const ranges=selection?Array.from({length:selection.rangeCount},(_,i)=>selection.getRangeAt(i).cloneRange()):[];
+    const start=focused?.selectionStart,end=focused?.selectionEnd;
+    const field=document.createElement("textarea");field.value=text;field.readOnly=true;field.tabIndex=-1;
+    field.setAttribute("aria-hidden","true");field.style.cssText="position:fixed;left:-9999px;top:0;opacity:0";
+    document.body.append(field);
+    try{
+      field.focus();field.select();
+      if(!document.execCommand?.("copy"))throw new Error("剪贴板不可用");
+    }finally{
+      field.remove();focused?.focus?.({preventScroll:true});
+      if(typeof start==="number"&&typeof end==="number")focused.setSelectionRange?.(start,end);
+      if(selection){selection.removeAllRanges();for(const range of ranges)selection.addRange(range)}
+    }
+  }
+  async function copyMarkdown(text,button){
+    button.disabled=true;button.textContent="复制 Markdown";
+    try{
+      try{
+        if(!scope.navigator.clipboard?.writeText)throw new Error("使用兼容复制");
+        await scope.navigator.clipboard.writeText(text);
+      }catch(error){fallbackCopy(text)}
+      button.textContent="已复制";toast("已复制 Markdown");
+      setTimeout(()=>{button.textContent="复制 Markdown"},1800);
+    }catch(error){toast("复制失败，请允许剪贴板访问后重试，或手动选择正文复制。")}
+    finally{button.disabled=false}
+  }
   function integrityText(report){
     const p=report.profile||{},c=p.coverage||{},u=p.usage||{};
+    if(p.analysis_version==='fast-v4')return `\n\n## 分析记录\n\n- 分析版本：fast-v4，已移除镜头检测\n- 实际分辨率：${p.source_width||'?'} × ${p.source_height||'?'}\n- 固定采样：${p.visual_coverage?.sample_count||0} 帧，边抽帧边识别\n- 报告采用 ${c.selected_units||0}/${c.total_units||0} 个完整证据单元，关联 ${c.covered_clips||0}/${c.total_clips||0} 个切片\n- 未进入报告的单元：${c.omitted_units||0}，原始证据仍保留（不等于语义召回率）\n- 转写复用：${p.transcript_reused||'否'}\n- 云端请求：${u.requests||0}，输入tokens：${u.prompt_tokens||0}，输出tokens：${u.completion_tokens||0}\n- 报告截断：${p.report_truncated?'是':'否'}\n`;
     if(!p.analysis_version||p.analysis_version==='legacy')return '\n\n> 分析版本：旧版，复用已保存的报告。';
     if(c.representative)return `\n\n## 分析记录\n\n- 分析版本：${p.analysis_version}\n- 实际分辨率：${p.source_width||'?'} × ${p.source_height||'?'}\n- 固定采样：${p.visual_coverage?.sample_count||0} 帧\n- 单次报告取样：${c.covered_clips||0}/${c.total_clips||0} 切片（代表性节选，未逐条总结全片）\n- 云端请求：${u.requests||0}，输入tokens：${u.prompt_tokens||0}，输出tokens：${u.completion_tokens||0}\n- 报告截断：${p.report_truncated?'是':'否'}\n`;
     return `\n\n## 分析完整性记录\n\n- 分析版本：${p.analysis_version}\n- 实际分辨率：${p.source_width||'?'} × ${p.source_height||'?'}\n- 切片处理覆盖：${c.covered_clips||0}/${c.total_clips||report.clip_count||0}，${Math.round((c.ratio||0)*100)}%（不等于语义召回率或逐帧观看）\n- 云端请求：${u.requests||0}，输入tokens：${u.prompt_tokens||0}，输出tokens：${u.completion_tokens||0}\n- 报告截断：${p.report_truncated?'是，报告尚未完成':'否'}\n\n## 章节与关键事实索引\n\n`+(p.summary_tree||[]).map(node=>`### ${stamp(node.start_ms)} — ${stamp(node.end_ms)} · 层级 ${node.level}\n\n${node.summary}\n\n${(node.facts||[]).map(f=>'- '+f).join('\n')}\n\n证据ID：${(node.evidence_ids||[]).join(', ')}\n切片：${(node.clip_ids||[]).join(', ')}`).join('\n\n');
   }
   function integrityHtml(report){
     const p=report.profile||{},c=p.coverage||{},u=p.usage||{};
+    if(p.analysis_version==='fast-v4')return `<details class="analysis-notices"><summary>分析记录 · 完整事实 ${c.selected_units||0}/${c.total_units||0} 单元</summary><p>fast-v4 · 已移除镜头检测 · ${p.source_width||'?'} × ${p.source_height||'?'}</p><p>固定采样 ${p.visual_coverage?.sample_count||0} 帧，复用解码器并边抽帧边识别。报告与索引并行生成。</p><p>本报告关联 ${c.covered_clips||0}/${c.total_clips||0} 个切片；未采用 ${c.omitted_units||0} 个完整单元，原文仍保留。相同OCR只打包一份并保留出现时间，关联切片不等于完整事实召回。</p><p>转写复用：${escape(p.transcript_reused||'否')} · 云端请求 ${u.requests||0} · 输入 ${u.prompt_tokens||0} / 输出 ${u.completion_tokens||0} tokens</p><details class="raw-evidence" data-video="${escape(report.video_id)}" data-run="${escape(p.analysis_run_id)}"><summary>原始语音 / 画面 / OCR证据</summary><div class="raw-evidence-content">展开后加载</div></details></details>`;
     if(!p.analysis_version||p.analysis_version==='legacy')return '<div class="message-meta">分析版本：旧版 · 复用已保存的报告</div>';
     const cost=u.estimated_cost==null?'':` · 估算费用 ${Number(u.estimated_cost).toFixed(4)}（按配置单价）`;
     if(c.representative)return `<details class="analysis-notices"><summary>分析记录 · 单次报告取样 ${c.covered_clips||0}/${c.total_clips||0} 切片</summary><p>版本 ${escape(p.analysis_version)} · 实际分辨率 ${p.source_width||'?'} × ${p.source_height||'?'}</p><p>固定采样 ${p.visual_coverage?.sample_count||0} 帧；整帧识别，不执行局部加密或高清裁图。报告为代表性节选，未逐条总结全片。</p><p>云端请求 ${u.requests||0} · 输入 ${u.prompt_tokens||0} / 输出 ${u.completion_tokens||0} tokens${cost}</p><details class="raw-evidence" data-video="${escape(report.video_id)}" data-run="${escape(p.analysis_run_id)}"><summary>原始语音 / 画面 / OCR证据</summary><div class="raw-evidence-content">展开后加载</div></details></details>`;
@@ -66,20 +97,26 @@
         const choices=[...(payload.attachment_id?["附件"]:[]),...(payload.urls||[])];
         content+=`<ol class="source-choices">${choices.map((value,i)=>`<li><button type="button" data-choice="${i+1}">${escape(value)}</button></li>`).join("")}</ol>`;
       }
-      item.innerHTML=`<div class="message-author">${title}</div><div class="message-content markdown-body">${content}</div>`;
-      if(message.kind==="report"){
+      item.innerHTML=author(title,message.role!=="user")+`<div class="message-content markdown-body">${content}</div>`;
+      if(message.kind==="report"||(message.role!=="user"&&message.kind==="answer"&&message.text?.trim())){
         const actions=document.createElement("div");actions.className="message-actions";
-        const download=document.createElement("button");download.type="button";download.textContent="导出报告";download.onclick=()=>exportReport(payload);
-        actions.append(download);
-        if(detailed()){
-          const transcript=document.createElement("button");transcript.type="button";transcript.textContent="查看转写";
-          transcript.onclick=async()=>{
-            let box=item.querySelector(".transcript-view");
-            if(box){box.hidden=!box.hidden;return}
-            box=document.createElement("div");box.className="transcript-view";box.textContent="加载中…";item.append(box);
-            try{const data=await api(`/internal/videos/${payload.video_id}/transcript`);box.textContent=(data.segments||[]).map(s=>`[${stamp(s.start_ms)}] ${s.text}`).join("\n")||"（无转写内容）"}
-            catch(error){box.textContent=error.message}
-          };actions.append(transcript);
+        const copy=document.createElement("button");copy.type="button";copy.className="copy-markdown";copy.textContent="复制 Markdown";
+        copy.setAttribute("aria-label",message.kind==="report"?"复制报告 Markdown":"复制回答 Markdown");
+        copy.onclick=()=>copyMarkdown(message.kind==="report"?reportText(payload):message.text,copy);
+        actions.append(copy);
+        if(message.kind==="report"){
+          const download=document.createElement("button");download.type="button";download.textContent="导出报告";download.onclick=()=>exportReport(payload);
+          actions.append(download);
+          if(detailed()){
+            const transcript=document.createElement("button");transcript.type="button";transcript.textContent="查看转写";
+            transcript.onclick=async()=>{
+              let box=item.querySelector(".transcript-view");
+              if(box){box.hidden=!box.hidden;return}
+              box=document.createElement("div");box.className="transcript-view";box.textContent="加载中…";item.append(box);
+              try{const data=await api(`/internal/videos/${payload.video_id}/transcript`);box.textContent=(data.segments||[]).map(s=>`[${stamp(s.start_ms)}] ${s.text}`).join("\n")||"（无转写内容）"}
+              catch(error){box.textContent=error.message}
+            };actions.append(transcript);
+          }
         }
         item.append(actions);
       }
@@ -101,7 +138,7 @@
     }
     if(streamText&&active()){
       const pending=document.createElement("article");pending.className="conversation-message assistant streaming";
-      pending.innerHTML='<div class="message-author">知影 · 正在回答</div><div class="message-content markdown-body">'+VideoLensMarkdown.render(streamText)+"</div>";
+      pending.innerHTML=author('知影 · 正在回答')+'<div class="message-content markdown-body">'+VideoLensMarkdown.render(streamText)+"</div>";
       flow.append(pending);
     }
     const operation=snapshot?.operation,status=$("#operationStatus");

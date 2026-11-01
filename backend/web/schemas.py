@@ -30,6 +30,7 @@ class AnalyzeRequest(BaseModel):
     skip_vectors: bool = Field(False, description="跳过向量写入（只留 SQLite）")
     force: bool = Field(False, description="强制重跑，忽略已有结果")
     resume: bool = Field(True, description="断点续跑（跳过已完成阶段）")
+    reuse_transcript: bool = Field(True, description="复用内容与ASR参数一致的转写；关闭用于完整性能对照")
     max_keyframes: int | None = Field(None, ge=1, le=5000)
 
     @field_validator("source")

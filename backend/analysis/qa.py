@@ -23,7 +23,7 @@ def scope_of(question):
 def active_ledger(orch, video_id):
     report = orch._repo.get_video_report(video_id) or {}
     profile = report.get('profile') or {}
-    if profile.get('analysis_version') not in {VERSION, 'integrity-v2'}:
+    if profile.get('analysis_version') not in {VERSION, 'fast-v3', 'integrity-v2'}:
         return None
     row = orch._repo._query_one('SELECT * FROM analysis_runs WHERE run_id=? AND status=?',
                                 (profile.get('analysis_run_id'), 'ready'))

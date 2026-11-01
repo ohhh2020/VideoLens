@@ -8,13 +8,13 @@
 /* 首屏同步读取主题，避免深色模式刷新闪白。 */
 try{const m=localStorage.getItem('videolens.theme')||'system';const t=m==='dark'||(m==='system'&&matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';document.documentElement.dataset.theme=t;document.documentElement.style.colorScheme=t}catch(e){}
 </script>
-<link rel="stylesheet" href="/assets/workbench/style.css?v=local-links-v1">
+<link rel="stylesheet" href="/assets/workbench/style.css?v=markdown-copy-1">
 <link rel="stylesheet" href="/assets/shared/markdown.css?v=local-links-v1">
 </head>
 <body>
 <div class="wrap">
   <div class="nav">
-    <div class="brand">知影 <span class="brand-en">VideoLens</span><small>让视频成为可对话的知识</small></div>
+    <div class="brand"><img class="zhiying-avatar brand-avatar" src="/assets/workbench/assets/zhiying-avatar.jpg" width="40" height="40" alt=""><div>知影 <span class="brand-en">VideoLens</span><small>让视频成为可对话的知识</small></div></div>
     <div class="spacer"></div>
     <fluent-button type="button" appearance="subtle" class="btn ghost" id="draftNew">新对话</fluent-button>
     <fluent-button type="button" appearance="subtle" class="btn ghost" id="historyToggle" aria-label="展开历史对话" aria-controls="historySidebar" aria-expanded="false">历史对话</fluent-button>
@@ -144,7 +144,7 @@ try{const m=localStorage.getItem('videolens.theme')||'system';const t=m==='dark'
       <p class="muted">选择后立即预览当前完整报告；保存后记住偏好并同步其他打开的工作台。切换不重新分析，也不删除完整报告内容。</p>
     </div>
     <details class="card" id="qualitySettings"><summary>分析质量与资源</summary>
-        <p class="muted">新分析采用固定间隔采样、整帧识别与单次报告，不执行局部加密、高清裁图或分层章节摘要。报告均匀取样最多32个切片，原始证据另存；新设置仅影响之后创建的任务。总预算按UTF-8字节保守估算，实际用量以服务商返回为准。本地视频通过软链接读取原文件，最多2小时 / 8 GiB。价格留0时只统计请求与tokens。</p>
+        <p class="muted">新分析已移除镜头检测：语音与固定抽帧/整帧识别并行，总结与索引并行。在同一预算内按完整句子、表格行和代码块选取证据，保护数字和限制条件，重复OCR保留时间关联。未采用的原文另存；不执行局部加密、高清裁图或分层摘要。新设置仅影响之后创建的任务。总预算按UTF-8字节保守估算，实际用量以服务商返回为准。本地视频通过软链接读取原文件，最多2小时 / 8 GiB。</p>
       <div id="qualityFields"></div>
     </details>
     <button class="btn" id="saveSet">保存设置</button>
@@ -152,29 +152,43 @@ try{const m=localStorage.getItem('videolens.theme')||'system';const t=m==='dark'
     <div class="card" style="margin-top:14px"><h3>当前通道状态</h3><div id="setBackends"></div></div>
   </section>
   <section class="tabpane" id="p-memory">
-    <div class="card">
-      <h3>偏好记忆库</h3>
-      <p class="muted">从视频分析历史和你的提问中归纳兴趣与关注点，供后续总结和回答参考。你可以随时增加、修改或删除。</p>
+    <div class="memory-heading">
+      <div><h2>记忆</h2><p class="muted">让知影记住你在意的事。所有记忆集中保存在一个空间中。</p></div>
+      <button type="button" class="btn" id="memoryCreate">创建记忆</button>
+    </div>
+    <p id="memoryStatus" class="muted" role="status" aria-live="polite"></p>
+    <details class="card memory-space" id="memorySpace">
+      <summary><span><b>记忆空间</b><span class="memory-count" id="memoryCount">0 条</span></span><span class="memory-space-toggle"><span class="when-closed">展开</span><span class="when-open">收起</span></span></summary>
+      <div class="memory-selection">
+        <label><input type="checkbox" id="memorySelectAll">全选</label>
+        <span class="muted" id="memorySelectionCount" aria-live="polite">已选 0 条</span>
+        <span class="spacer"></span>
+        <button type="button" class="btn ghost" id="memoryClearSelection" disabled>取消选择</button>
+        <button type="button" class="btn danger" id="memoryDeleteSelected" disabled>删除所选</button>
+      </div>
+      <div id="memoryList"></div>
+    </details>
+    <details class="card memory-settings">
+      <summary>记忆设置与存储</summary>
+      <p class="muted">从视频分析历史和你的提问中归纳记忆，供后续总结和回答参考。关闭自动归纳后仍可手动编辑。</p>
       <div class="checks">
         <label><input type="checkbox" id="memoryEnabled">在总结和对话中使用记忆</label>
         <label><input type="checkbox" id="memoryAuto">从历史自动归纳</label>
       </div>
       <button class="btn ghost" id="memoryRefresh">从历史更新</button>
       <button class="btn ghost" id="memoryReload">刷新列表</button>
-      <a href="#memoryNew" class="tlink">增加记忆</a>
-      <p id="memoryStatus" class="muted" role="status"></p>
-      <p class="muted">关闭自动归纳后仍可手动编辑。删除会移除文字和向量，不会从相同的已处理历史重复生成；新的历史仍可形成新记忆。</p>
-    </div>
-    <div id="memoryList"></div>
-    <div class="card">
-      <h3>增加记忆</h3>
-      <label for="memoryNew">用一段精简完整的话描述偏好</label>
-      <textarea id="memoryNew" rows="2" placeholder="例如：用户更关注本地 AI 部署的实际性能，希望回答优先给出硬件需求与可执行步骤。"></textarea>
-      <label for="memoryNewKind">偏好类型</label>
-      <select id="memoryNewKind"><option value="interest">视频兴趣</option><option value="question">问题关注点</option><option value="style">回答风格（适用于所有主题）</option></select>
-      <button class="btn" id="memoryAdd" style="margin-top:12px">增加记忆</button>
-    </div>
-    <p class="muted" id="memoryFile"></p>
+      <p class="muted">删除会同时移除文字和向量，不会从相同的已处理历史重复生成；新的历史仍可形成新记忆。</p>
+      <p class="muted" id="memoryFile"></p>
+    </details>
+    <dialog id="memoryEditor" class="memory-editor" aria-labelledby="memoryEditorTitle">
+      <form id="memoryEditorForm">
+        <div class="memory-editor-heading"><h3 id="memoryEditorTitle">创建记忆</h3><button type="button" id="memoryEditorClose" class="btn ghost" aria-label="关闭记忆编辑器">关闭</button></div>
+        <label for="memoryNew">用一段精简完整的话记录你希望知影记住的内容</label>
+        <textarea id="memoryNew" rows="5" required placeholder="例如：我更关注硬件的实际性能，希望回答优先给出实测数据与可执行步骤。"></textarea>
+        <p id="memoryEditorStatus" class="muted" role="status" aria-live="polite"></p>
+        <div class="memory-editor-actions"><button type="button" class="btn ghost" id="memoryEditorCancel">取消</button><button type="submit" class="btn" id="memoryAdd">创建记忆</button></div>
+      </form>
+    </dialog>
   </section>
 </div>
 <div class="toast" id="toast"></div>
@@ -185,11 +199,11 @@ try{const m=localStorage.getItem('videolens.theme')||'system';const t=m==='dark'
 <script src="/assets/vendor/purify.min.js" defer></script>
 <script src="/assets/shared/markdown.js" defer></script>
 <script src="/assets/workbench/progress.js" defer></script>
-<script src="/assets/workbench/memory.js" defer></script>
+<script src="/assets/workbench/memory.js?v=memory-space-v1" defer></script>
 <script src="/assets/workbench/service.js" defer></script>
 <script src="/assets/workbench/keys.js" defer></script>
 <script src="/assets/workbench/quality.js?v=local-links-v1" defer></script>
-<script src="/assets/workbench/conversations.js?v=local-links-v1" defer></script>
+<script src="/assets/workbench/conversations.js?v=markdown-copy-1" defer></script>
 <script src="/assets/workbench/app.js?v=local-links-v1" defer></script>
 </body>
 </html>

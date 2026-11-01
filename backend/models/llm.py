@@ -259,9 +259,8 @@ class OpenAICompatibleBackend:
             if remaining <= 0:
                 break
             try:
-                with urllib.request.urlopen(
-                    request, timeout=max(0.01, remaining)
-                ) as response:
+                from backend.models.http_transport import open_request
+                with open_request(self, request, max(0.01, remaining)) as response:
                     raw = response.read()
                 data = json.loads(raw.decode("utf-8"))
                 return self._parse(data, started)
@@ -296,6 +295,10 @@ class OpenAICompatibleBackend:
                     delay = min(delay, max(0.0, deadline - time.monotonic()))
                 time.sleep(delay)
         raise LlmError(f"云端 LLM 调用失败: {last_error}")
+
+    def close(self):
+        from backend.models.http_transport import close_pool
+        close_pool(self)
 
     def _parse(self, data: Any, started: float) -> LlmResponse:
         if not isinstance(data, dict):
@@ -344,7 +347,8 @@ class OpenAICompatibleBackend:
         finished = False
         metadata = {"finish_reason": "", "prompt_tokens": 0, "completion_tokens": 0}
         try:
-            with urllib.request.urlopen(request, timeout=timeout_s) as response:
+            from backend.models.http_transport import open_request
+            with open_request(self, request, timeout_s) as response:
                 for raw_line in response:
                     line = raw_line.decode("utf-8", errors="replace").strip()
                     if not line or not line.startswith("data:"):

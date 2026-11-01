@@ -132,15 +132,24 @@ class MemoryStore:
             return {k:v for k,v in item.items() if k!="vector"}
 
     def delete(self, item_id):
+        self.delete_many([item_id])
+
+    def delete_many(self, item_ids):
+        """多选删除一次原子提交；任一记录失效时不进行部分删除。"""
+        if not isinstance(item_ids, list) or not item_ids or any(not isinstance(i, str) or not i for i in item_ids):
+            raise MemoryError("请选择要删除的记忆")
+        wanted = set(item_ids)
         with self.lock:
             data = self.snapshot()
-            item = next((i for i in data["items"] if i["id"]==item_id),None)
-            if item is None:
-                raise KeyError(item_id)
-            data["items"] = [i for i in data["items"] if i["id"]!=item_id]
+            found = {i['id'] for i in data['items'] if i['id'] in wanted}
+            if found != wanted:
+                raise KeyError(next(iter(wanted - found)))
+            removed = [i for i in data['items'] if i['id'] in wanted]
+            data["items"] = [i for i in data["items"] if i['id'] not in wanted]
             # 仅保留不可逆摘要和已读历史标识，不保留删掉的文字或向量。
-            data["blocked_hashes"] = list(set(data["blocked_hashes"])|{text_hash(item["text"])})
+            data["blocked_hashes"] = list(set(data["blocked_hashes"]) | {text_hash(item['text']) for item in removed})
             self._commit(data)
+            return [i['id'] for i in removed]
 
     def options(self, *, enabled, auto_learn):
         with self.lock:

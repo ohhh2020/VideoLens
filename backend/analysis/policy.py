@@ -87,7 +87,7 @@ class IntegritySection:
                 raise ValueError(f'{name} 必须在128至131072之间')
 
 
-VERSION = 'fast-v3'
+VERSION = 'fast-v4'
 
 
 def estimate_tokens(text):
