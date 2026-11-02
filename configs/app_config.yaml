@@ -78,6 +78,9 @@ asr:
   cpu_threads: 4
   num_workers: 1
   batch_size: 4
+  isolate_cuda: true
+  worker_timeout_s: 90
+  worker_start_timeout_s: 60
   language: null
   vad_filter: true
   vad_min_silence_ms: 500
@@ -265,6 +268,8 @@ memory:
 # 完整性版本：总预算包含提示词/历史/证据/输出预留；仅新任务使用。
 integrity:
   enabled: true
+  # 关键词共现模型为可选试验；尚未证明云端报告不降速，默认保留原评分。
+  keyword_assist: false
   scan_long_side: 640
   scan_fps: 1.0
   max_sample_gap_s: 10.0

@@ -1,0 +1,10 @@
+{
+  "allowed_groups": {"description": "允许使用的QQ群号；空列表允许所有群", "type": "list", "default": []},
+  "trigger": {"description": "首次分析关键词", "type": "string", "default": "视频分析"},
+  "mcp_server": {"description": "AstrBot MCP服务名称", "type": "string", "default": "videolens"},
+  "poll_seconds": {"description": "任务查询间隔（秒）", "type": "int", "default": 2},
+  "timeout_seconds": {"description": "群内等待分析的最长秒数，超时不取消后端任务", "type": "int", "default": 1800},
+  "result_format": {"description": "分析与追问结果格式，默认本地Markdown转图片；text为纯文字", "type": "string", "default": "image", "options": ["image", "text"]},
+  "message_characters": {"description": "文字模式单条QQ回复最大字符数，超长按段落分条", "type": "int", "default": 2800},
+  "self_test_prefix": {"description": "仅指定群自测时临时允许的本账号消息前缀；日常留空", "type": "string", "default": ""}
+}

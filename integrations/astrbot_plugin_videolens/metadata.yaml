@@ -1,0 +1,9 @@
+name: astrbot_plugin_videolens
+display_name: 知影视频分析
+desc: 回复Bilibili视频发送“视频分析”，回复原视频继续追问；通过本机MCP复用VideoLens。
+version: v1.1.1
+author: VideoLens
+repo: https://github.com/ohhh2020/VideoLens
+support_platforms:
+  - aiocqhttp
+astrbot_version: '>=4.29.4,<5'

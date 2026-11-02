@@ -98,6 +98,9 @@ def apply_local_devices(orch, config, persist):
             asr._model, asr._loaded_key = candidate_asr._model, candidate_asr._loaded_key
             asr.config = candidate_asr.config
             candidate_asr._model = None
+            from backend.models.asr_worker import AsrWorker
+            if isinstance(retired_asr, AsrWorker):
+                retired_asr.close()
             del retired_asr
         orch._cfg = runtime_config
         for model in retired:

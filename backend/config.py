@@ -35,6 +35,7 @@ from backend.analysis.policy import IntegritySection
 import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -368,6 +369,9 @@ class AsrSection:
     cpu_threads: int = 4
     num_workers: int = 1
     batch_size: int = 4
+    isolate_cuda: bool = True
+    worker_timeout_s: float = 90
+    worker_start_timeout_s: float = 60
     language: str | None = None
     vad_filter: bool = True
     vad_min_silence_ms: int = 500
@@ -381,6 +385,10 @@ class AsrSection:
         for name in ("cpu_threads", "num_workers", "batch_size"):
             if getattr(self, name) < 1:
                 raise ConfigValueError(f"asr.{name}", ">= 1", getattr(self, name))
+        for name in ('worker_timeout_s', 'worker_start_timeout_s'):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise ConfigValueError(f'asr.{name}', '有限正数', value)
         if self.beam_size < 1:
             raise ConfigValueError("asr.beam_size", ">= 1", self.beam_size)
         if not 0.0 <= self.min_language_probability <= 1.0:

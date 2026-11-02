@@ -99,6 +99,8 @@ class OptimizedTests(unittest.TestCase):
         asr = SimpleNamespace(config=AsrConfig(device='cuda'), _model_path=lambda: directory)
         orch = SimpleNamespace(_asr=asr, _cfg=self.cfg)
         key, identity = transcripts.identity(orch, audio)
+        asr.config = replace(asr.config, isolate_cuda=False, worker_timeout_s=15)
+        self.assertEqual(key, transcripts.identity(orch, audio)[0], '执行隔离/超时不应作废有效转写')
         value = Transcript(video_id='old', segments=(TranscriptSegment(0,0,1000,'价格750元。',
             words=(Word('750元', 100, 900),)),), device='cuda')
         transcripts.write(orch, key, identity, value)

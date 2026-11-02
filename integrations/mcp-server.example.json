@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "videolens": {
+      "command": "D:/Environment/AstrBot/python.exe",
+      "args": ["D:/Project/vl/VideoLens/integrations/videolens_mcp/server.py"],
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONPYCACHEPREFIX": "D:/Project/vl/VideoLens-runtime/cache/pycache",
+        "VIDEOLENS_URL": "http://127.0.0.1:8000",
+        "VIDEOLENS_MCP_STATE": "D:/Project/vl/VideoLens-runtime/data/mcp/qqbot.sqlite3"
+      },
+      "active": true
+    }
+  }
+}

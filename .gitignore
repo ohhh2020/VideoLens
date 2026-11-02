@@ -3,6 +3,7 @@
 .env.*
 **/user_settings.json
 **/runtime-config.json
+**/qqbot-local.json
 **/cookies.txt
 **/*apiKey*.csv
 *.pem

@@ -6,6 +6,7 @@ import math
 @dataclass(frozen=True, slots=True)
 class IntegritySection:
     enabled: bool = True
+    keyword_assist: bool = False
     scan_long_side: int = 640
     scan_fps: float = 1.0
     max_sample_gap_s: float = 10.0

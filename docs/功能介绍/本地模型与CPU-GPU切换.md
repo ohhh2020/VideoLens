@@ -31,6 +31,24 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 
 Whisper 的 CUDA DLL 从当前 Conda 环境、NVIDIA Python 包及 PyTorch 库目录定位，无需把 CUDA 库加入系统 PATH。目标 GPU 不可用时明确失败，不悄悄退回 CPU。FFmpeg / FFprobe 仍由系统 PATH 定位。
 
+## Windows CUDA 转写隔离
+
+Windows上选择GPU运行Whisper时，模型由同一Conda环境中的受控子进程加载，网页进程持有代理，不重复加载一份Whisper权重。子进程随服务管理，连续视频复用同一份模型；切换CPU、卸载模型或正常关闭服务时回收。CPU转写保持原来的进程内执行方式。
+
+如果CTranslate2的原生调用长时间没有返回，普通Python线程无法安全终止它。现在可以回收卡住的转写子进程，使任务明确失败并释放本服务的推理锁。用户之后手动重试会创建新的CUDA上下文，不自动重新分析或改用CPU，不生成空转写冒充成功。
+
+`configs/app_config.yaml`的`asr`段提供以下配置，修改后需重新启动VideoLens：
+
+```yaml
+isolate_cuda: true
+worker_timeout_s: 90        # 等待准备完成或下一个语音片段的最长秒数
+worker_start_timeout_s: 60  # 严格加载模型的最长秒数
+```
+
+超时按准备状态及实际片段重置，不是整部视频只能分析90秒。模型、精度、beam size、词级时间戳和初始batch均保持原设置；OOM仍缩批，不切换设备。隔离与超时设置不作废有效转写缓存，也不自动重算旧视频。独立进程不报告未经测量的GPU峰值，日志会注明未测量。
+
+此次真实样本及异常恢复测试见[Whisper原生调用卡住修复](../更新日志/2026-11-02Whisper原生卡住修复.md)。
+
 ## 报告视图与 Markdown
 
 用户模式只展示内容概览和关键结论，详细模式保留完整报告、统计与转写入口。切换立即预览，保存后同步浏览器其他工作台，不删除完整数据，也不重新分析视频。

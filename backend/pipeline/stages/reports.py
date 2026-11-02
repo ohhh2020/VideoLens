@@ -414,8 +414,10 @@ class ReportStages:
             from backend.analysis.optimized import enabled as optimized
             if optimized(self):
                 from backend.analysis.packing import summarize
+                # 当前偏好仅由视频标题查询决定；预算试算不得反复编码同一查询。
+                preference_prefix = self._preference_messages([], title, report=True)
                 text = summarize(self._repo, video_id, title, self._llm, self._cfg.integrity, self._analysis_run,
-                    preference=lambda messages: self._preference_messages(messages, title, report=True))
+                    preference=lambda messages: [*preference_prefix, *messages])
                 return text, 'cloud'
             from backend.analysis.fast import enabled
             if enabled(self):

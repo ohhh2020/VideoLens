@@ -23,6 +23,9 @@ def digest_file(path):
 def identity(orch, audio):
     config = orch._asr.config
     parameters = asdict(config)
+    # 执行隔离与超时不改变识别参数，兼容升级前的转写缓存键。
+    for name in ('isolate_cuda', 'worker_timeout_s', 'worker_start_timeout_s'):
+        parameters.pop(name, None)
     # 权重更换或ASR配置变更会失效；不读取或散列数GB权重正文。
     model = Path(orch._asr._model_path())
     weights = [(p.name, p.stat().st_size, p.stat().st_mtime_ns)

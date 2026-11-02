@@ -11,6 +11,7 @@ import logging
 import threading
 from functools import lru_cache
 import re
+import sys
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -72,6 +73,9 @@ class AsrConfig:
     cpu_threads: int = 4
     num_workers: int = 1
     batch_size: int = 4
+    isolate_cuda: bool = True
+    worker_timeout_s: float = 90
+    worker_start_timeout_s: float = 60
     condition_on_previous_text: bool = False
     temperature: tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
     no_speech_threshold: float = 0.6
@@ -92,6 +96,10 @@ class AsrConfig:
             raise ValueError("cpu_threads 应 >= 1")
         if self.batch_size < 1 or self.num_workers < 1:
             raise ValueError("batch_size 和 num_workers 应 >= 1")
+        import math
+        for value in (self.worker_timeout_s, self.worker_start_timeout_s):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError('Whisper进程超时必须是有限正数')
         if not 0.0 <= self.max_repeat_ratio <= 1.0:
             raise ValueError("max_repeat_ratio 应在 0..1")
 
@@ -114,6 +122,9 @@ class AsrConfig:
             "cpu_threads",
             "num_workers",
             "batch_size",
+            "isolate_cuda",
+            "worker_timeout_s",
+            "worker_start_timeout_s",
         ):
             value = getattr(asr, name, None)
             if value is not None:
@@ -338,19 +349,13 @@ class AsrEngine:
 
         :raises AsrError: 指定的设备或精度不可用
         """
-        try:
-            import faster_whisper  # type: ignore[import-not-found]
-        except ImportError as exc:  # pragma: no cover - 取决于环境
-            raise AsrError(
-                "未安装 faster-whisper，请执行 `python -m pip install -r requirements.txt`"
-            ) from exc
-
         _ensure_cuda_dlls()
         model_path = self._model_path()
         plan = self._device_plan()
         key = (str(model_path), plan[0][0], plan[0][1])
-        if self._model is not None and not force_reload and self._loaded_key == key:
+        if self.is_loaded and not force_reload and self._loaded_key == key:
             return self._model
+        retired = self._model
 
         errors: list[str] = []
         for device, compute in plan:
@@ -361,14 +366,17 @@ class AsrEngine:
                     compute,
                     model_path.name,
                 )
-                model = faster_whisper.WhisperModel(
-                    str(model_path),
-                    device=device,
-                    compute_type=compute,
-                    cpu_threads=self.config.cpu_threads,
-                    num_workers=self.config.num_workers,
-                    local_files_only=True,
-                )
+                if sys.platform == 'win32' and str(device).startswith('cuda') and self.config.isolate_cuda:
+                    from backend.models.asr_worker import AsrWorker
+                    model = AsrWorker({'path': str(model_path), 'device': device, 'compute_type': compute,
+                                       'cpu_threads': self.config.cpu_threads, 'num_workers': self.config.num_workers},
+                                      timeout=self.config.worker_timeout_s, start_timeout=self.config.worker_start_timeout_s)
+                    logger.info('Whisper使用独立CUDA进程 pid=%s，无进展超时=%ss', model.process.pid, self.config.worker_timeout_s)
+                else:
+                    import faster_whisper  # type: ignore[import-not-found]
+                    model = faster_whisper.WhisperModel(
+                        str(model_path), device=device, compute_type=compute,
+                        cpu_threads=self.config.cpu_threads, num_workers=self.config.num_workers, local_files_only=True)
             except Exception as exc:  # noqa: BLE001
                 message = f"{device}/{compute}: {type(exc).__name__}: {exc}"
                 errors.append(message)
@@ -376,6 +384,9 @@ class AsrEngine:
                 continue
             self._model = model
             self._loaded_key = (str(model_path), device, compute)
+            from backend.models.asr_worker import AsrWorker
+            if isinstance(retired, AsrWorker):
+                retired.close()
             logger.info(
                 "Whisper 就绪 device=%s compute_type=%s",
                 device,
@@ -389,17 +400,23 @@ class AsrEngine:
 
     def unload(self) -> None:
         """释放模型引用（配合 ``ModelManager`` 的显存管理）。"""
+        from backend.models.asr_worker import AsrWorker
+        if isinstance(self._model, AsrWorker):
+            self._model.close()
         self._model = None
         self._loaded_key = None
         logger.debug("Whisper 模型引用已释放")
 
     @property
     def is_loaded(self) -> bool:
+        from backend.models.asr_worker import AsrWorker
+        if isinstance(self._model, AsrWorker):
+            return self._model.alive
         return self._model is not None
 
     @property
     def active_device(self) -> tuple[str, str]:
-        if self._loaded_key is None:
+        if self._loaded_key is None or not self.is_loaded:
             return ("", "")
         return (self._loaded_key[1], self._loaded_key[2])
 
@@ -567,20 +584,29 @@ class AsrEngine:
         batch = min(maximum, self._learned_batch, self.config.batch_size if not device.startswith('cuda') else maximum)
         while True:
             try:
-                if batch > 1:
+                from backend.models.asr_worker import AsrWorker
+                if isinstance(model, AsrWorker):
+                    # 子进程直接使用CT2，不用Torch逐50ms轮询另一个CUDA上下文。
+                    raw_segments, info = model.transcribe(str(path), batch, options)
+                    segments_list = list(raw_segments)
+                    peak, minimum = 0, 0
+                elif batch > 1:
                     from faster_whisper import BatchedInferencePipeline
                     runner = BatchedInferencePipeline(model=model)
                     raw_segments, info = runner.transcribe(str(path), batch_size=batch, **options)
                 else:
                     raw_segments, info = model.transcribe(str(path), **options)
-                with GpuMemoryProbe(device) as probe:
-                    segments_list = list(raw_segments)
+                if not isinstance(model, AsrWorker):
+                    with GpuMemoryProbe(device) as probe:
+                        segments_list = list(raw_segments)
+                    peak, minimum = probe.used, probe.minimum
                 self.last_batch_size = batch
-                self._batch_peak = max(self._batch_peak, probe.used)
+                self._batch_peak = max(self._batch_peak, peak)
                 self._learned_batch = batch
-                if device.startswith('cuda') and probe.minimum > max(256*1024**2, self._batch_peak) * 3:
+                if device.startswith('cuda') and minimum > max(256*1024**2, self._batch_peak) * 3:
                     self._learned_batch = min(maximum, batch * 2)
-                logger.info('Whisper批次完成 actual_batch=%d peak_device_delta=%.1fMiB next_batch=%d', batch, probe.used/1024**2, self._learned_batch)
+                logger.info('Whisper批次完成 actual_batch=%d peak_device_delta=%s next_batch=%d', batch,
+                            '未测量（独立进程）' if isinstance(model, AsrWorker) else f'{peak/1024**2:.1f}MiB', self._learned_batch)
                 break
             except Exception as exc:
                 if not device.startswith('cuda') or not is_oom(exc) or batch == 1:

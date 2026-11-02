@@ -1,17 +1,18 @@
 """同预算下完整事实选取：保留原句/表格/代码，OCR去重不丢时间关联。"""
-from collections import Counter, defaultdict
+from collections import defaultdict
 import hashlib
 import json
 import logging
-import math
 import re
+import time
 
 from backend.analysis.policy import estimate_tokens
+from backend.analysis.keywords import MODEL as KEYWORD_MODEL, LEGACY_MODEL, extract as keywords, legacy_extract, matcher
 
 logger = logging.getLogger('zhiying.analysis')
 FACT = re.compile(r'\d|不支持|不能|不得|必须|仅限|除外|前提|注意|先.+再|领先|落后|提高|下降|增加|减少|步骤|限制|条件|never|must|only', re.I)
 RELATION = re.compile(r'领先|落后|提高|下降|增加|减少|高于|低于|不支持|不能|必须|仅限|除外|前提|\d.*[%％]|步骤|第[一二三四五六七八九十\d]+步|先.+再', re.I)
-STOP = {'用户','视频','这个','那个','我们','你们','他们','就是','可以','一个','然后','因为','所以','还有','进行','以及','一些','不是','这样','现在','已经','没有','时候','这次','大家','比较','内容','画面','文字','一下','可能','如果','对于'}
+QUANTITY = re.compile(r'\d+(?:[,.]\d+)*[%％]?')
 
 
 def atomic_units(text):
@@ -50,28 +51,7 @@ def atomic_units(text):
     return result
 
 
-def keywords(documents, limit=24):
-    import jieba
-    jieba.setLogLevel(logging.WARNING)
-    tokenized = []
-    for text in documents:
-        words = [word.lower() for word in jieba.lcut(text)
-                 if 2 <= len(word.strip()) <= 24 and word not in STOP and re.search(r'[\w\u4e00-\u9fff]', word)
-                 and not word.isdecimal()]
-        words += re.findall(r'\b[a-zA-Z][a-zA-Z0-9_.+-]*\d[a-zA-Z0-9_.+-]*\b', text)
-        tokenized.append(words)
-    df, scores = Counter(), Counter()
-    for words in tokenized:
-        df.update(set(words))
-    for words in tokenized:
-        for word, count in Counter(words).items():
-            scores[word] += (1 + math.log(count)) * (1 + math.log((len(documents) + 1) / (df[word] + 1)))
-    top = scores.most_common(limit)
-    scale = top[0][1] if top else 1
-    return [(word, value / scale) for word, value in top]
-
-
-def candidates(evidence, semantic=None):
+def candidates(evidence, semantic=None, *, keyword_assist=False):
     """重复OCR仅打包一次；每个出现位置和源证据ID完整保存在关联清单。"""
     grouped = {}
     for row in evidence:
@@ -87,33 +67,53 @@ def candidates(evidence, semantic=None):
             grouped[key] = {'id': uid, 'kind': row['kind'], 'text': text, 'start_ms': row['start_ms'],
                 'end_ms': row['end_ms'], 'occurrences': [occurrence], 'fact': bool(FACT.search(text))}
     units = list(grouped.values())
-    tags = keywords([row['text'] for row in evidence])
+    extract = keywords if keyword_assist else legacy_extract
+    tags = extract([row['text'] for row in evidence])
+    matches = [(matcher(word), weight) for word, weight in tags] if keyword_assist else []
     for unit in units:
         text = unit['text'].lower()
+        quantities = min(8, len(set(QUANTITY.findall(text)))) if keyword_assist else 0
+        keyword_score = (sum(weight for match, weight in matches if match(text)) if keyword_assist
+                         else sum(weight for word, weight in tags if word.lower() in text))
         unit['score'] = (1 + (3 if unit['fact'] else 0) + (4 if RELATION.search(text) else 0)
-                        + sum(weight for word, weight in tags if word.lower() in text))
+                        + keyword_score
+                        # 关键词只是辅助：数据密集的原句/表格不应被反复提及主题的短句挤掉。
+                        + .25 * quantities)
         # 仅在规则与关键词不足、现有BGE向量已可用时补充，不额外推理或等待GPU。
         if not tags and semantic:
             unit['score'] += max((semantic.get(row['evidence_id'], 0) for row in unit['occurrences']), default=0)
     return units, tags
 
 
-def select(evidence, make_messages, budget, *, semantic=None):
-    units, tags = candidates(evidence, semantic)
+def select(evidence, make_messages, budget, *, semantic=None, incremental=False, keyword_assist=False):
+    """incremental仅用于固定JSON信封、偏好前缀已固定的报告消息。"""
+    started = time.perf_counter()
+    units, tags = candidates(evidence, semantic, keyword_assist=keyword_assist)
+    scoring_ms = (time.perf_counter() - started) * 1000
     all_clips = sorted({row['clip_id'] for row in evidence}, key=lambda cid: min(row['start_ms'] for row in evidence if row['clip_id'] == cid))
     selected, selected_ids, included_sources = [], set(), set()
+    base_cost = estimate_tokens(json.dumps(make_messages([]), ensure_ascii=False))
+    selected_cost = base_cost
     omitted = []
     def payload(unit):
         seconds = max(0, unit['start_ms'] // 1000)
         return {'id': unit['id'], 'kind': unit['kind'], 'time': f'{seconds//3600:02d}:{seconds//60%60:02d}:{seconds%60:02d}',
                 'text': unit['text'], 'repeats': len(unit['occurrences'])}
     def add(unit, cap=budget):
+        nonlocal selected_cost
         if unit['id'] in selected_ids:
             return True
         candidate = payload(unit)
-        if estimate_tokens(json.dumps(make_messages([*selected, candidate]), ensure_ascii=False)) > cap:
+        if incremental:
+            # evidence_units先编码进content，再编码为消息JSON；按相同双层转义计算。
+            cost = selected_cost + estimate_tokens(json.dumps(json.dumps(candidate, ensure_ascii=False),
+                ensure_ascii=False)) - 2 + (2 if selected else 0)
+        else:
+            cost = estimate_tokens(json.dumps(make_messages([*selected, candidate]), ensure_ascii=False))
+        if cost > cap:
             return False
         selected.append(candidate); selected_ids.add(unit['id'])
+        selected_cost = cost
         included_sources.update(row['evidence_id'] for row in unit['occurrences'])
         return True
     ranked = sorted(units, key=lambda u: (-(u['score'] / max(80, len(u['text'].encode()))**.5), u['start_ms']))
@@ -132,17 +132,21 @@ def select(evidence, make_messages, budget, *, semantic=None):
     for index in dict.fromkeys(positions):
         cid = all_clips[index]
         if by_clip[cid]:
-            add(by_clip[cid][0], cap=max(estimate_tokens(json.dumps(make_messages([]), ensure_ascii=False)) + 512, int(budget * .55)))
+            add(by_clip[cid][0], cap=max(base_cost + 512, int(budget * .55)))
     for unit in ranked:
         if not add(unit):
             omitted.append(unit['id'])
     selected.sort(key=lambda row: (row['time'], row['kind'], row['id']))
+    if incremental and estimate_tokens(json.dumps(make_messages(selected), ensure_ascii=False)) != selected_cost:
+        raise ValueError('增量预算与实际报告消息不匹配，未发送可能超限的上下文')
     selected_clips = {item['clip_id'] for unit in units if unit['id'] in selected_ids for item in unit['occurrences']}
     metadata = {'unit_count': len(units), 'selected_units': len(selected), 'omitted_units': omitted,
         'omitted_count': len(units) - len(selected), 'selected_clips': [cid for cid in all_clips if cid in selected_clips],
         'total_clips': len(all_clips), 'selected_evidence_ids': sorted(included_sources),
         'selected_characters': sum(len(row['text']) for row in selected),
         'raw_characters': sum(len(row['text']) for row in evidence), 'keywords': [word for word, _ in tags],
+        'keyword_model': KEYWORD_MODEL if keyword_assist else LEGACY_MODEL,
+        'keyword_assist': keyword_assist, 'evidence_scoring_ms': round(scoring_ms, 3),
         'unit_provenance': [{**unit, 'selected': unit['id'] in selected_ids} for unit in units],
         'semantic_assist_used': bool(not tags and semantic)}
     if not selected:
@@ -160,7 +164,8 @@ def summarize(repo, video_id, title, llm, policy, ledger, preference=lambda mess
         return preference([{'role': 'system', 'content': instruction}, {'role': 'user', 'content':
             json.dumps({'title': title, 'total_clips': len(clips), 'evidence_units': rows}, ensure_ascii=False)}])
     budget = policy.report_input_tokens - policy.report_output_tokens - 512
-    rows, metadata = select(evidence, messages, budget, semantic=ledger.get('evidence_semantic_scores'))
+    rows, metadata = select(evidence, messages, budget, semantic=ledger.get('evidence_semantic_scores'),
+        incremental=True, keyword_assist=policy.keyword_assist)
     ledger.put('report_selection', metadata)
     ledger.put('report_provenance', metadata['unit_provenance'])
     ledger.put('report_keywords', metadata['keywords'])

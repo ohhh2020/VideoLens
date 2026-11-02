@@ -35,6 +35,11 @@ ROOT = TESTS_DIR.parent
 
 #: (文件名, 分类, 说明) —— 顺序即执行顺序，从底层依赖向上。
 SUITES: tuple[tuple[str, str, str], ...] = (
+    ("test_keywords.py", "关键词", "有界TF-IDF/TextRank、完整型号、重复OCR与来源保护"),
+    ("test_mcp_bridge.py", "MCP接入", "本机地址、B站来源、异步任务、卡片解析、会话隔离与长消息完整输出"),
+    ("test_asr_worker.py", "语音转写", "独立CUDA进程复用、原生超时回收、异常与设备精度保护"),
+    ("test_astrbot_install.py", "QQ插件", "临时目录中的源码同步、版本核对、备份与图片输出配置"),
+    ("test_qq_card.py", "QQ卡片", "替身HTTP验证正式Ark生成、JSON消息段与无效卡片拒绝"),
     ("test_optimized_analysis.py", "并行分析", "无镜头检测、复用解码、边产帧边识别、转写缓存与完整事实预算"),
     ("test_local_links.py", "本地视频", "真实软链接、原文件保护、本机选择器与视频库会话标题"),
     ("test_fast_analysis.py", "性能回退", "固定采样、整帧识别、单次报告与旧版快照兼容"),
